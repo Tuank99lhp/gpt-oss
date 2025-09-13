@@ -1,0 +1,68 @@
+// axpy_batched.cu
+// Batched AXPY for HIP (no external libs).
+// X[b, i] += alpha * Y[b, i]   (or alpha[b] per-sample)
+// Layout expected: contiguous row-major per sample: [B, N]
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#ifndef HIP_CHECK
+#define HIP_CHECK(cmd) do { \
+  hipError_t _e = (cmd);    \
+  if (_e != hipSuccess) {   \
+    fprintf(stderr, "HIP error %d (%s) at %s:%d\n", \
+            (int)_e, hipGetErrorString(_e), __FILE__, __LINE__); \
+    exit(1); \
+  } \
+} while(0)
+#endif
+
+// ========================== batched (alpha chung) ==========================
+// X[b*N + i] += alpha * Y[b*N + i]
+__global__ void k_axpy_batch(float * __restrict__ X,
+                             const float * __restrict__ Y,
+                             float alpha, int N, int B) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; // along N
+  int b = blockIdx.y;                             // batch index
+  if (b >= B || i >= N) return;
+
+  size_t off = (size_t)b * (size_t)N + (size_t)i;
+  X[off] += alpha * Y[off];
+}
+static inline void axpy_gpu_batch(float *X, const float *Y,
+                                  float alpha, int N, int B,
+                                  hipStream_t stream = 0) {
+  const int BSx = 256;
+  dim3 block(BSx, 1, 1);
+  dim3 grid((N + BSx - 1) / BSx, B, 1);
+  hipLaunchKernelGGL(k_axpy_batch, grid, block, 0, stream, X, Y, alpha, N, B);
+}
+
+// ========================== batched (alpha theo mẫu) ==========================
+// X[b*N + i] += alpha[b] * Y[b*N + i]
+__global__ void k_axpy_batch_alpha_vec(float * __restrict__ X,
+                                       const float * __restrict__ Y,
+                                       const float * __restrict__ alpha_b,
+                                       int N, int B) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = blockIdx.y;
+  if (b >= B || i >= N) return;
+
+  float a = alpha_b[b];
+  size_t off = (size_t)b * (size_t)N + (size_t)i;
+  X[off] += a * Y[off];
+}
+static inline void axpy_gpu_batch_alpha_vec(float *X, const float *Y,
+                                            const float *alpha_b, // [B]
+                                            int N, int B,
+                                            hipStream_t stream = 0) {
+  const int BSx = 256;
+  dim3 block(BSx, 1, 1);
+  dim3 grid((N + BSx - 1) / BSx, B, 1);
+  hipLaunchKernelGGL(k_axpy_batch_alpha_vec, grid, block, 0, stream,
+                     X, Y, alpha_b, N, B);
+}
