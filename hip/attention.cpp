@@ -73,7 +73,7 @@ static void attn_scores_gpu(const float *q, const float *k_cache,
 static void attn_weighted_sum_gpu(const float *att, const float *v_cache,
                                   float *tb, int head_dim, int kv_mul,
                                   int seq_len, int pos, int kv_dim, int n_heads) {
-  int row_len = pos + 2;           // include sink
+  int row_len = pos + 1;           // include sink
   int row_stride = seq_len + 1;    // physical stride used when storing att
   dim3 grid(n_heads);
   dim3 block((unsigned)head_dim);
