@@ -110,7 +110,8 @@ __global__ void k_rope_k_batch(float* __restrict__ k_all, // [L, MAX_BATCH, seq_
 }
 
 // ======= Bộ nhớ cache inv_freq (tạo 1 lần, dùng lại) =======
-static float* g_inv_freq_dev = nullptr; // [half] on device
+static float *g_inv_freq_dev = nullptr; // [half] on device
+float        *d_conc = nullptr;
 static int    g_cached_hd    = 0;
 static float  g_cached_base  = 0.f, g_cached_scale = 0.f, g_cached_ic = 0.f, g_cached_b = 0.f, g_cached_a = 0.f;
 static float  g_concentration = 1.f;
@@ -131,12 +132,8 @@ static inline void rope_ensure_invfreq(int head_dim, float base,
 
   if (!need_rebuild) return;
 
-  if (g_inv_freq_dev) HIP_CHECK(hipFree(g_inv_freq_dev));
+  // if (g_inv_freq_dev) HIP_CHECK(hipFree(g_inv_freq_dev));
   const int half = head_dim >> 1;
-  HIP_CHECK(hipMalloc(&g_inv_freq_dev, (size_t)half * sizeof(float)));
-
-  float* d_conc = nullptr;
-  HIP_CHECK(hipMalloc(&d_conc, sizeof(float)));
 
   const int BS = 256;
   dim3 grid((half + BS - 1) / BS);
@@ -146,7 +143,7 @@ static inline void rope_ensure_invfreq(int head_dim, float base,
                      ntk_beta, ntk_alpha, d_conc, g_inv_freq_dev);
   HIP_CHECK(hipMemcpyAsync(&g_concentration, d_conc, sizeof(float), hipMemcpyDeviceToHost, stream));
   HIP_CHECK(hipStreamSynchronize(stream));
-  HIP_CHECK(hipFree(d_conc));
+  // HIP_CHECK(hipFree(d_conc));
 
   g_cached_hd    = head_dim;
   g_cached_base  = base;

@@ -39,26 +39,24 @@ static void softmax_gpu(float *x, int n) {
 
 // GPU argmax
 static int sample_argmax_gpu(const float *p, int n) {
-    float *h_p = (float*)malloc(n * sizeof(float));
     HIP_CHECK(hipMemcpy(h_p, p, n * sizeof(float), hipMemcpyDeviceToHost));
     int m = 0;
     float mv = h_p[0];
     for (int i = 1; i < n; i++) {
         if (h_p[i] > mv) { mv = h_p[i]; m = i; }
     }
-    free(h_p);
+    // free(h_p);
     return m;
 }
 
 // GPU multinomial sampling
 static int sample_mult_gpu(float *p, int n, float coin) {
-    float *h_p = (float*)malloc(n * sizeof(float));
     HIP_CHECK(hipMemcpy(h_p, p, n * sizeof(float), hipMemcpyDeviceToHost));
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += h_p[i];
         if (coin < cdf) {
-            free(h_p);
+            // free(h_p);
             return i;
         }
     }
@@ -67,7 +65,6 @@ static int sample_mult_gpu(float *p, int n, float coin) {
 }
 
 static int sample_topp_gpu(float *p, int n, float topp, ProbIndex *probindex, float coin) {
-    float *h_p = (float*)malloc(n * sizeof(float));
     HIP_CHECK(hipMemcpy(h_p, p, n * sizeof(float), hipMemcpyDeviceToHost));
     int n0 = 0;
     const float cutoff = (1.0f - topp) / (n - 1);
@@ -93,7 +90,7 @@ static int sample_topp_gpu(float *p, int n, float topp, ProbIndex *probindex, fl
     for (int i = 0; i <= last_idx; i++) {
         cdf += probindex[i].prob;
         if (r < cdf) {
-            free(h_p);
+            // free(h_p);
             return probindex[i].index;
         }
     }

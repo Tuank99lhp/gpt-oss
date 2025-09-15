@@ -121,25 +121,3 @@ static inline void split_qkv_gpu_batch_devicepos(const float* qkvB,
                      qkvB, q_outB, k_all, v_all, d_positions,
                      head_dim, n_q, n_kv, B, seq_len, layer, MAX_BATCH_SIZE);
 }
-
-// positions ở host → copy tạm sang device (nhanh; B nhỏ)
-static inline void split_qkv_gpu_batch_hostidx(const float* qkvB,
-                                               float* q_outB,
-                                               float* k_all,
-                                               float* v_all,
-                                               const int* h_positions,  // host
-                                               int head_dim, int n_q, int n_kv,
-                                               int B, int seq_len,
-                                               int layer, int MAX_BATCH_SIZE,
-                                               hipStream_t stream=0)
-{
-  int* d_pos = nullptr;
-  HIP_CHECK(hipMalloc(&d_pos, B * sizeof(int)));
-  HIP_CHECK(hipMemcpyAsync(d_pos, h_positions, B*sizeof(int), hipMemcpyHostToDevice, stream));
-
-  split_qkv_gpu_batch_devicepos(qkvB, q_outB, k_all, v_all, d_pos,
-                                head_dim, n_q, n_kv, B, seq_len,
-                                layer, MAX_BATCH_SIZE, stream);
-
-  HIP_CHECK(hipFree(d_pos));
-}

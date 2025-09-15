@@ -86,6 +86,13 @@ float **MOE_batch_partial_on_dev0 = nullptr;
 int   *h_topk_i = nullptr;
 float *h_topk_v = nullptr;
 
+int   *d_current_tokens = nullptr;
+int   *d_positions = nullptr;
+float *cosB = nullptr;
+float *sinB = nullptr;
+
+float *h_p = nullptr;
+
 #include "../forward.cpp"
 #include "../sample.cpp"
 
@@ -672,6 +679,18 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   h_topk_i = (int*)  malloc((size_t)MAX_BATCH_SIZE * (size_t)transformer->config.experts_per_token * sizeof(int));
   h_topk_v = (float*)malloc((size_t)MAX_BATCH_SIZE * (size_t)transformer->config.experts_per_token * sizeof(float));
+
+  HIP_CHECK(hipMalloc(&d_current_tokens, MAX_BATCH_SIZE * sizeof(int)));
+  HIP_CHECK(hipMalloc(&d_positions, MAX_BATCH_SIZE * sizeof(int)));
+  
+  const int half = transformer->config.head_dim / 2;
+  HIP_CHECK(hipMalloc(&cosB, (size_t)MAX_BATCH_SIZE * (size_t)half * sizeof(float)));
+  HIP_CHECK(hipMalloc(&sinB, (size_t)MAX_BATCH_SIZE * (size_t)half * sizeof(float)));
+
+  h_p = (float*)malloc(transformer->config.vocab_size * sizeof(float));
+    
+  HIP_CHECK(hipMalloc(&g_inv_freq_dev, (size_t)half * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_conc, sizeof(float)));
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -697,6 +716,16 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     free(h_topk_v);
     h_topk_v = nullptr;
   }
+
+  HIP_CHECK(hipFree(d_current_tokens));
+  HIP_CHECK(hipFree(d_positions));
+  HIP_CHECK(hipFree(cosB));
+  HIP_CHECK(hipFree(sinB));
+
+  free(h_p);
+
+  HIP_CHECK(hipFree(g_inv_freq_dev));
+  HIP_CHECK(hipFree(d_conc));
 }
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,

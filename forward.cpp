@@ -361,6 +361,69 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
   return s.logits;
 }
 
+__global__ void k_embedding_gather(const int* __restrict__ token_ids,
+                                   const float* __restrict__ emb, // [V, H]
+                                   float* __restrict__ out,       // [B, H]
+                                   int B, int H) {
+  int b = blockIdx.x;
+  if (b >= B) return;
+  int tid = threadIdx.x;
+  int tok = token_ids[b];
+  const float* src = emb + (size_t)tok * (size_t)H;
+  float*       dst = out + (size_t)b * (size_t)H;
+
+  // vectorize khi có thể
+  int i = tid;
+  for (; i + 3 < H; i += blockDim.x) {
+    float4 v = *reinterpret_cast<const float4*>(&src[i]);
+    *reinterpret_cast<float4*>(&dst[i]) = v;
+  }
+  for (; i < H; i += blockDim.x) dst[i] = src[i];
+}
+
+void embedding_gather(float* out, const float* emb, const int* d_tok, int B, int H, hipStream_t st) {
+  int BS = 256;
+  k_embedding_gather<<<B, BS, 0, st>>>(d_tok, emb, out, B, H);
+}
+
+// Giả định: hidden_dim % 4 == 0
+// Layout: emb [V, H], out [B, H]
+__global__ void k_embedding_gather_vec4(const int* __restrict__ token_ids,
+                                        const float* __restrict__ emb,
+                                        float* __restrict__ out,
+                                        int B, int H)
+{
+    int b = blockIdx.x;
+    if (b >= B) return;
+
+    int tid = threadIdx.x;
+
+    // Con trỏ đầu hàng nguồn/đích
+    int tok = token_ids[b];
+    const float* src = emb + (size_t)tok * (size_t)H;
+    float*       dst = out + (size_t)b   * (size_t)H;
+
+    // Vector view (128-bit)
+    const float4* __restrict__ src4 = reinterpret_cast<const float4*>(src);
+    float4* __restrict__       dst4 = reinterpret_cast<float4*>(dst);
+
+    int H4 = H >> 2; // = H/4 phần tử float4
+
+    // Mỗi thread xử lý các i4 = tid, tid+blockDim.x, ...
+    for (int i4 = tid; i4 < H4; i4 += blockDim.x) {
+        float4 v = src4[i4];  // 16B load (coalesced nếu các thread liên tiếp)
+        dst4[i4] = v;         // 16B store
+    }
+}
+
+// Launcher: 1 block cho mỗi sample, 256 threads (bội số của 64 trên AMD)
+void embedding_gather_vec4(float* out, const float* emb, const int* d_tok,
+                           int B, int H, hipStream_t st)
+{
+    int BS = 256; // 256 hoặc 128; nhớ bội số của 64 (wavefront)
+    k_embedding_gather_vec4<<<B, BS, 0, st>>>(d_tok, emb, out, B, H);
+}
+
 void forward_batch(Transformer *transformer, int batch_size) {
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
@@ -373,25 +436,17 @@ void forward_batch(Transformer *transformer, int batch_size) {
   int n_qkv_heads = p->n_attn_heads + 2 * p->n_kv_heads;
   const int row_stride = p->seq_len + 1;
 
-  int* d_positions = nullptr;
-  HIP_CHECK(hipMalloc(&d_positions, batch_size * sizeof(int)));
+  HIP_CHECK(hipMemcpyAsync(d_current_tokens, g_batch_state->current_tokens, 
+                          batch_size * sizeof(int), hipMemcpyHostToDevice, 0));
+                          
+  if (hidden_dim % 4 == 0) {
+    embedding_gather_vec4(g_batch_state->batch_x, w->token_embedding_table, d_current_tokens, batch_size, hidden_dim, 0);
+  } else {
+    embedding_gather(g_batch_state->batch_x, w->token_embedding_table, d_current_tokens, batch_size, hidden_dim, 0);
+  }
+
   HIP_CHECK(hipMemcpyAsync(d_positions, g_batch_state->positions,
                           batch_size * sizeof(int), hipMemcpyHostToDevice, 0));
-  
-  const int half = head_dim / 2;
-  float *cosB = nullptr, *sinB = nullptr;
-  HIP_CHECK(hipMalloc(&cosB, (size_t)batch_size * (size_t)half * sizeof(float)));
-  HIP_CHECK(hipMalloc(&sinB, (size_t)batch_size * (size_t)half * sizeof(float)));
-
-  #pragma omp parallel for num_threads(batch_size)
-  for (int b = 0; b < batch_size; ++b) {
-    if (g_batch_state->finished[b]) {
-      continue;
-    }
-    float *x = g_batch_state->batch_x + b * hidden_dim;
-    float *content_row = w->token_embedding_table + g_batch_state->current_tokens[b] * hidden_dim;
-    HIP_CHECK(hipMemcpy(x, content_row, hidden_dim * sizeof(float), hipMemcpyDeviceToDevice));
-  }
 
   float ntk_beta  = 32.0f;
   float ntk_alpha = 1.0f;
@@ -427,12 +482,12 @@ void forward_batch(Transformer *transformer, int batch_size) {
       head_dim * n_qkv_heads
     );
 
-    split_qkv_gpu_batch_hostidx(
+    split_qkv_gpu_batch_devicepos(
       g_batch_state->batch_qkv,
       g_batch_state->batch_q,
       g_batch_state->batch_k,
       g_batch_state->batch_v,
-      g_batch_state->positions,
+      d_positions,
       head_dim,
       p->n_attn_heads,
       p->n_kv_heads,
@@ -699,10 +754,6 @@ void forward_batch(Transformer *transformer, int batch_size) {
     p->vocab_size,
     batch_size
   );
-
-  HIP_CHECK(hipFree(cosB));
-  HIP_CHECK(hipFree(sinB));
-  HIP_CHECK(hipFree(d_positions));
 
   HIP_CHECK(hipDeviceSynchronize());
 }
