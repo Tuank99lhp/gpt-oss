@@ -66,7 +66,7 @@ __global__ void k_attn_weighted_sum_batch(const float* __restrict__ attB,
   if (h >= n_heads || b >= B) return;
 
   const int pos = positions[b];
-  const int row_len = pos + 2; // gồm sink
+  const int row_len = pos + 1; // gồm sink
 
   const float* att_row = attB + ((size_t)b * (size_t)n_heads + (size_t)h) * (size_t)row_stride;
   float* out_h = tbB + (size_t)b * (size_t)n_heads * (size_t)head_dim + (size_t)h * (size_t)head_dim;

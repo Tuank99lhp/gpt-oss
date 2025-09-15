@@ -954,29 +954,6 @@ void forward_batch(Transformer *transformer, int batch_size) {
       batch_size
     );
     
-    rmsnorm_batch_gpu(
-      g_batch_state->batch_t,
-      g_batch_state->batch_x,
-      w->rms_ffn_w + l * hidden_dim,
-      batch_size, hidden_dim
-    );
-
-    gemv_gpu_batch(
-      g_batch_state->batch_router_score,
-      g_batch_state->batch_t,
-      w->w_router + l * hidden_dim * p->n_experts,
-      hidden_dim,
-      p->n_experts,
-      batch_size
-    );
-
-    add_bias_gpu_batch_broadcast(
-      g_batch_state->batch_router_score,
-      w->b_router + l * p->n_experts,
-      batch_size,
-      p->n_experts
-    );
-
     {
 
       rmsnorm_batch_gpu(
@@ -1225,6 +1202,8 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
       if (next_token == 199999 || next_token == 200002 || pos >= max_steps) {
         g_batch_state->finished[i] = true;
+        free(g_batch_state->prompt_tokens[i]);
+        g_batch_state->prompt_tokens[i] = nullptr;
         active_count--;
 
         int *output_tokens = get_tok_gen_ptr(requests, req_idx);
