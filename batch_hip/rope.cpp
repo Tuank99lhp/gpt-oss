@@ -5,33 +5,33 @@
 // - Không áp RoPE cho V (đúng như code của bạn).
 
 // ======= (giữ nguyên thuật toán inv_freq của bạn) =======
-// __global__ void k_compute_concentration_and_inv_freq(
-//     float base, int head_dim, float scaling_factor, float initial_context_length,
-//     float ntk_beta, float ntk_alpha, float *concentration_out, float *inv_freq_out) {
-//   int d_half = head_dim / 2;
-//   int i = threadIdx.x + blockIdx.x * blockDim.x;
-//   if (i >= d_half) return;
+__global__ void k_compute_concentration_and_inv_freq(
+    float base, int head_dim, float scaling_factor, float initial_context_length,
+    float ntk_beta, float ntk_alpha, float *concentration_out, float *inv_freq_out) {
+  int d_half = head_dim / 2;
+  int i = threadIdx.x + blockIdx.x * blockDim.x;
+  if (i >= d_half) return;
 
-//   float freq = powf(base, ((float)(2 * i)) / (float)head_dim);
-//   float concentration;
-//   if (scaling_factor > 1.0f) {
-//     concentration = 0.1f * logf(scaling_factor) + 1.0f;
-//     float low = d_half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) / logf(base);
-//     float high = d_half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(base);
-//     float interpolation = 1.0f / (scaling_factor * freq);
-//     float extrapolation = 1.0f / freq;
-//     float ramp = ((float)i - low) / (high - low);
-//     if (ramp < 0) ramp = 0;
-//     if (ramp > 1) ramp = 1;
-//     float mask = 1.0f - ramp;
-//     inv_freq_out[i] = interpolation * (1.0f - mask) + extrapolation * mask;
-//     if (i == 0) *concentration_out = concentration;
-//   } else {
-//     concentration = 1.0f;
-//     inv_freq_out[i] = 1.0f / freq;
-//     if (i == 0) *concentration_out = concentration;
-//   }
-// }
+  float freq = powf(base, ((float)(2 * i)) / (float)head_dim);
+  float concentration;
+  if (scaling_factor > 1.0f) {
+    concentration = 0.1f * logf(scaling_factor) + 1.0f;
+    float low = d_half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) / logf(base);
+    float high = d_half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(base);
+    float interpolation = 1.0f / (scaling_factor * freq);
+    float extrapolation = 1.0f / freq;
+    float ramp = ((float)i - low) / (high - low);
+    if (ramp < 0) ramp = 0;
+    if (ramp > 1) ramp = 1;
+    float mask = 1.0f - ramp;
+    inv_freq_out[i] = interpolation * (1.0f - mask) + extrapolation * mask;
+    if (i == 0) *concentration_out = concentration;
+  } else {
+    concentration = 1.0f;
+    inv_freq_out[i] = 1.0f / freq;
+    if (i == 0) *concentration_out = concentration;
+  }
+}
 
 // ======= Build cos/sin cho cả batch (dựa trên positions[b]) =======
 __global__ void k_build_cos_sin_batch(const int* __restrict__ positions,
