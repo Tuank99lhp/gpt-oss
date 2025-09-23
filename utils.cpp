@@ -11,7 +11,7 @@
 #ifndef WARP_SIZE
 #define WARP_SIZE warpSize        // 64 on AMD, 32 on NVIDIA
 #endif
-
+struct Float2 { float x, y; };
 struct __align__(16) Float4 { float x,y,z,w; };
 
 __device__ __forceinline__ int dmin(int a, int b) { return a < b ? a : b; }
@@ -53,3 +53,5 @@ void set_vec(float *x, float *v, int n) {
   const int BS = 256, GS = (n + BS - 1) / BS;
   hipLaunchKernelGGL(k_set_vec, dim3(GS), dim3(BS), 0, 0, x, v, n);
 }
+
+int ceil_div(int n, int d) { return (n + d - 1) / d; }

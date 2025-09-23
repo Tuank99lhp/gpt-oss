@@ -3,14 +3,6 @@
 // ---------- k_softmax_rows_with_sink_batch ----------
 // Gộp append sink + softmax cho từng (b,h).
 // sink: [n_heads] của layer l (giống bạn đang dùng)
-__device__ __forceinline__ float warp_max(float v){
-  for (int off = WARP_SIZE>>1; off>0; off>>=1) v = fmaxf(v, __shfl_down(v, off, WARP_SIZE));
-  return v;
-}
-__device__ __forceinline__ float warp_sum(float v){
-  for (int off = WARP_SIZE>>1; off>0; off>>=1) v += __shfl_down(v, off, WARP_SIZE);
-  return v;
-}
 
 __global__ void k_softmax_rows_with_sink_batch(float* __restrict__ attB,
                                                const float* __restrict__ sink,
@@ -41,7 +33,7 @@ __global__ void k_softmax_rows_with_sink_batch(float* __restrict__ attB,
   float sink_val = sink[h];
   local_max = fmaxf(local_max, sink_val);
 
-  float wmax = warp_max(local_max);
+  float wmax = warp_reduce_max(local_max);
   __shared__ float warp_buf[32];              // đủ cho <= 32 warps
   if (lane == 0) warp_buf[warp] = wmax;
   __syncthreads();
@@ -49,7 +41,7 @@ __global__ void k_softmax_rows_with_sink_batch(float* __restrict__ attB,
   float mx = -INFINITY;
   if (warp == 0) {
     float v = (lane < nwarps) ? warp_buf[lane] : -INFINITY;
-    float g = warp_max(v);
+    float g = warp_reduce_max(v);
     if (lane == 0) warp_buf[0] = g;
   }
   __syncthreads();
@@ -66,14 +58,14 @@ __global__ void k_softmax_rows_with_sink_batch(float* __restrict__ attB,
   if (tid == 0) row[sink_col] = e_sink;   // ghi tạm exp(sink)
   local_sum += (tid == 0 ? e_sink : 0.f);
 
-  float wsum = warp_sum(local_sum);
+  float wsum = warp_reduce_sum(local_sum);
   if (lane == 0) warp_buf[warp] = wsum;
   __syncthreads();
 
   float sum = 0.f;
   if (warp == 0) {
     float v = (lane < nwarps) ? warp_buf[lane] : 0.f;
-    float g = warp_sum(v);
+    float g = warp_reduce_sum(v);
     if (lane == 0) warp_buf[0] = g;
   }
   __syncthreads();

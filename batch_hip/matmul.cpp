@@ -450,38 +450,121 @@ static inline void gemv_gpu_batch(float* Y, const float* X, const float* W,
     gemv_gpu_batch_opt_splitK<TK,TB,true>(Y, X, W, K, M, B, splitK, waves_per_block, stream);
   }
 }
-
+// Scalar BF16 -> F32 (fallback)
 __device__ __forceinline__ float bf16_to_float(hip_bfloat16 h) {
-  // hip_bfloat16 là 16-bit (giống chuẩn IEEE754 BF16: 8-bit exponent, 7-bit mantissa)
-  // Chuyển bằng cách nhét 16 bit lên high bits của float32
   uint16_t lo = *reinterpret_cast<const uint16_t*>(&h);
   uint32_t hi = (uint32_t)lo << 16;
-  union { uint32_t u; float f; } cvt;
-  cvt.u = hi;
-  return cvt.f;
+  return __uint_as_float(hi);
+}
+
+// Packed BF16 loaders (aligned paths)
+// Load 2x bf16 as one u32 -> two f32
+__device__ __forceinline__ Float2 ld_bf16x2_to_f32x2(const hip_bfloat16* __restrict__ p) {
+  // Using a plain 32-bit load. Base alignment checks guard hot paths.
+  uint32_t u = *reinterpret_cast<const uint32_t*>(p);
+  Float2 r;
+  r.x = __uint_as_float((u & 0x0000FFFFu) << 16);
+  r.y = __uint_as_float( u & 0xFFFF0000u);
+  return r;
+}
+
+// Load 4x bf16 as one u64 -> four f32
+__device__ __forceinline__ Float4 ld_bf16x4_to_f32x4(const hip_bfloat16* __restrict__ p) {
+  uint64_t u = *reinterpret_cast<const uint64_t*>(p);
+  uint32_t lo = static_cast<uint32_t>(u);
+  uint32_t hi = static_cast<uint32_t>(u >> 32);
+
+  Float4 r;
+  // order: b0 (lo low16), b1 (lo high16), b2 (hi low16), b3 (hi high16)
+  r.x = __uint_as_float((lo & 0x0000FFFFu) << 16);
+  r.y = __uint_as_float( lo & 0xFFFF0000u);
+  r.z = __uint_as_float((hi & 0x0000FFFFu) << 16);
+  r.w = __uint_as_float( hi & 0xFFFF0000u);
+  return r;
+}
+
+// --------------------- Cooperative LDS loaders for X ---------------------
+template<bool VEC4>
+__device__ __forceinline__
+void preload_X_tile(float* __restrict__ dst_tile,        // [TB,TK] in LDS
+                    const float* __restrict__ X,         // [B,K]
+                    int b0, int TK, int K, int k0, int B,
+                    int TB, int threadsPerBlock, int tidLinear,
+                    bool X_base16)
+{
+  const int k_lim = dmin(TK, K - k0);
+  const bool stride16 = ((K & 3) == 0);
+  const bool vec4_ok = VEC4 && stride16 && ((k0 & 3) == 0) && (k_lim >= 4) && X_base16;
+
+  if (vec4_ok){
+    const int cols4  = (k_lim >> 2);
+    const int total4 = TB * cols4;
+    for (int idx4 = tidLinear; idx4 < total4; idx4 += threadsPerBlock){
+      int tb  = idx4 / cols4;
+      int tk4 = idx4 - tb * cols4;
+      int gb  = b0 + tb;
+      int gk  = k0 + (tk4 << 2);
+
+      Float4 v = {0,0,0,0};
+      if (gb < B){
+        const Float4* px = reinterpret_cast<const Float4*>(X + (size_t)gb * K + gk);
+        v = *px;
+      }
+      const int base = tb * TK + (tk4<<2);
+      // bounds already guaranteed by k_lim
+      dst_tile[base + 0] = v.x;
+      dst_tile[base + 1] = v.y;
+      dst_tile[base + 2] = v.z;
+      dst_tile[base + 3] = v.w;
+    }
+
+    // tiny tail (<=3)
+    const int vec_end = (cols4 << 2);
+    const int tail    = k_lim - vec_end;
+    if (tail){
+      const int span = TB * tail;
+      for (int idx = tidLinear; idx < span; idx += threadsPerBlock){
+        int tb = idx / tail;
+        int tk = idx - tb * tail;
+        int gb = b0 + tb;
+        int gk = k0 + vec_end + tk;
+        dst_tile[tb * TK + (vec_end + tk)] = (gb < B) ? X[(size_t)gb * K + gk] : 0.0f;
+      }
+    }
+  } else {
+    const int span = TB * k_lim;
+    for (int idx = tidLinear; idx < span; idx += threadsPerBlock){
+      int tb = idx / k_lim;
+      int tk = idx - tb * k_lim;
+      int gb = b0 + tb;
+      int gk = k0 + tk;
+      dst_tile[tb * TK + tk] = (gb < B) ? X[(size_t)gb * K + gk] : 0.0f;
+    }
+  }
 }
 
 // ================= Wave-per-row batched (no split-K) =================
 template<int TK=1024, int TB=4, bool VEC4=true>
-__global__ void k_gemv_batched_wave_row_shared_bf16(const hip_bfloat16* __restrict__ W, // [M,K] (BF16)
-                                               const float*       __restrict__ X, // [B,K]
-                                               float*             __restrict__ Y, // [B,M]
-                                               int K, int M, int B)
+__global__ void k_gemv_batched_wave_row_shared_bf16(
+    const hip_bfloat16* __restrict__ W, // [M,K] (BF16)
+    const float*       __restrict__ X,  // [B,K] (F32)
+    float*             __restrict__ Y,  // [B,M] (F32)
+    int K, int M, int B)
 {
   extern __shared__ float s[];
   float* X0 = s;
   float* X1 = s + (size_t)TB * TK;
 
-  const int wid  = warp_id();        // 0..waves_per_block-1
-  const int lane = lane_id();        // 0..WARP_SIZE-1
+  const int wid  = warp_id();                 // 0..waves_per_block-1
+  const int lane = lane_id();                 // 0..WARP_SIZE-1
   const int waves_per_block = blockDim.x / WARP_SIZE;
 
   const int b0 = blockIdx.y * TB;
   const int m0 = blockIdx.x * waves_per_block;
 
-  const int ty = threadIdx.y;        // 0..TB-1 (sample lane)
-  const int b  = b0 + ty;            // global sample
-  const int m  = m0 + wid;           // global row (per-wave)
+  const int ty = threadIdx.y;                 // 0..TB-1 (sample lane)
+  const int b  = b0 + ty;                     // global sample
+  const int m  = m0 + wid;                    // global row (per-wave)
 
   const bool active = (b < B) && (m < M);
   const bool smem_aligned16 = (((uintptr_t)s & 0xF) == 0);
@@ -495,55 +578,9 @@ __global__ void k_gemv_batched_wave_row_shared_bf16(const hip_bfloat16* __restri
   float acc = 0.0f;
   int   buf = 0;
 
-  // ---- Preload first tile of X into X0 ----
+  // ---- Preload first X tile into X0 ----
   int k0 = 0;
-  {
-    const int k_lim = dmin(TK, K - k0);
-    const bool vec4_ok = VEC4 && stride16 && ((k0 & 3) == 0) && (k_lim >= 4) && X_base16;
-
-    if (vec4_ok){
-      const int cols4  = (k_lim >> 2);
-      const int total4 = TB * cols4;
-      for (int idx4 = tidLinear; idx4 < total4; idx4 += threadsPerBlock){
-        int tb  = idx4 / cols4;
-        int tk4 = idx4 - tb * cols4;
-        int gb  = b0 + tb;
-        int gk  = k0 + (tk4 << 2);
-        Float4 v = {0,0,0,0};
-        if (gb < B){
-          const Float4* px = reinterpret_cast<const Float4*>(X + (size_t)gb * K + gk);
-          v = *px;
-        }
-        const int base = tb * TK + (tk4<<2);
-        if (0 <  k_lim) X0[base + 0] = v.x;
-        if (1 <  k_lim) X0[base + 1] = v.y;
-        if (2 <  k_lim) X0[base + 2] = v.z;
-        if (3 <  k_lim) X0[base + 3] = v.w;
-      }
-      // tail
-      const int vec_end = (cols4 << 2);
-      const int tail    = k_lim - vec_end;
-      if (tail){
-        const int span = TB * tail;
-        for (int idx = tidLinear; idx < span; idx += threadsPerBlock){
-          int tb = idx / tail;
-          int tk = idx - tb * tail;
-          int gb = b0 + tb;
-          int gk = k0 + vec_end + tk;
-          X0[tb * TK + (vec_end + tk)] = (gb < B) ? X[(size_t)gb * K + gk] : 0.0f;
-        }
-      }
-    } else {
-      const int span = TB * k_lim;
-      for (int idx = tidLinear; idx < span; idx += threadsPerBlock){
-        int tb = idx / k_lim;
-        int tk = idx - tb * k_lim;
-        int gb = b0 + tb;
-        int gk = k0 + tk;
-        X0[tb * TK + tk] = (gb < B) ? X[(size_t)gb * K + gk] : 0.0f;
-      }
-    }
-  }
+  preload_X_tile<VEC4>((float*)X0, X, b0, TK, K, k0, B, TB, threadsPerBlock, tidLinear, X_base16);
   __syncthreads();
 
   // ---- Main K loop (ping-pong X) ----
@@ -558,23 +595,25 @@ __global__ void k_gemv_batched_wave_row_shared_bf16(const hip_bfloat16* __restri
 
       if (VEC4 && smem_aligned16 && W_base16 && stride16 && ((k0 & 3) == 0) && (k_lim >= 4)){
         const int vec_end = (k_lim >> 2) << 2;
+
+        #pragma unroll 2
         for (int jj = lane * 4; jj < vec_end; jj += 4 * WARP_SIZE){
-          // Vector read X (shared), W đọc 4 phần tử bfloat16 rồi convert
-          const Float4* __restrict__ x4 = reinterpret_cast<const Float4*>(xrow + jj);
-          Float4 b = *x4;
-          float a0 = bf16_to_float(wrow[jj+0]);
-          float a1 = bf16_to_float(wrow[jj+1]);
-          float a2 = bf16_to_float(wrow[jj+2]);
-          float a3 = bf16_to_float(wrow[jj+3]);
-          acc = fmaf(a0, b.x, acc);
-          acc = fmaf(a1, b.y, acc);
-          acc = fmaf(a2, b.z, acc);
-          acc = fmaf(a3, b.w, acc);
+          // Vectorized loads: X from LDS, W as bf16x4 -> f32x4
+          const Float4* __restrict__ x4p = reinterpret_cast<const Float4*>(xrow + jj);
+          Float4 xb = *x4p;
+          Float4 aw = ld_bf16x4_to_f32x4(wrow + jj);
+
+          acc = fmaf(aw.x, xb.x, acc);
+          acc = fmaf(aw.y, xb.y, acc);
+          acc = fmaf(aw.z, xb.z, acc);
+          acc = fmaf(aw.w, xb.w, acc);
         }
-        for (int jj = ((k_lim>>2)<<2) + lane; jj < k_lim; jj += WARP_SIZE){
+        // tail
+        for (int jj = vec_end + lane; jj < k_lim; jj += WARP_SIZE){
           acc = fmaf(bf16_to_float(wrow[jj]), xrow[jj], acc);
         }
       } else {
+        // scalar fallback
         #pragma unroll 4
         for (int jj = lane; jj < k_lim; jj += WARP_SIZE){
           acc = fmaf(bf16_to_float(wrow[jj]), xrow[jj], acc);
@@ -585,52 +624,8 @@ __global__ void k_gemv_batched_wave_row_shared_bf16(const hip_bfloat16* __restri
     // ---- Preload next X tile (cooperative) ----
     const int next_k0 = k0 + TK;
     if (next_k0 < K){
-      const int next_lim = dmin(TK, K - next_k0);
-      const bool vec4_ok = VEC4 && stride16 && ((next_k0 & 3) == 0) && (next_lim >= 4) && X_base16;
-
-      if (vec4_ok){
-        const int cols4  = (next_lim >> 2);
-        const int total4 = TB * cols4;
-        for (int idx4 = tidLinear; idx4 < total4; idx4 += threadsPerBlock){
-          int tb  = idx4 / cols4;
-          int tk4 = idx4 - tb * cols4;
-          int gb  = b0 + tb;
-          int gk  = next_k0 + (tk4 << 2);
-          Float4 v = {0,0,0,0};
-          if (gb < B){
-            const Float4* px = reinterpret_cast<const Float4*>(X + (size_t)gb * K + gk);
-            v = *px;
-          }
-          const int base = tb * TK + (tk4<<2);
-          if (0 < next_lim) x_nxt[base + 0] = v.x;
-          if (1 < next_lim) x_nxt[base + 1] = v.y;
-          if (2 < next_lim) x_nxt[base + 2] = v.z;
-          if (3 < next_lim) x_nxt[base + 3] = v.w;
-        }
-        const int vec_end = (cols4 << 2);
-        const int tail    = next_lim - vec_end;
-        if (tail){
-          const int span = TB * tail;
-          for (int idx = tidLinear; idx < span; idx += threadsPerBlock){
-            int tb = idx / tail;
-            int tk = idx - tb * tail;
-            int gb = b0 + tb;
-            int gk = next_k0 + vec_end + tk;
-            x_nxt[tb * TK + (vec_end + tk)] = (gb < B) ? X[(size_t)gb * K + gk] : 0.0f;
-          }
-        }
-      } else {
-        const int span = TB * next_lim;
-        for (int idx = tidLinear; idx < span; idx += threadsPerBlock){
-          int tb = idx / next_lim;
-          int tk = idx - tb * next_lim;
-          int gb = b0 + tb;
-          int gk = next_k0 + tk;
-          x_nxt[tb * TK + tk] = (gb < B) ? X[(size_t)gb * K + gk] : 0.0f;
-        }
-      }
+      preload_X_tile<VEC4>((float*)x_nxt, X, b0, TK, K, next_k0, B, TB, threadsPerBlock, tidLinear, X_base16);
     }
-
     __syncthreads();
   }
 
@@ -643,10 +638,11 @@ __global__ void k_gemv_batched_wave_row_shared_bf16(const hip_bfloat16* __restri
 
 // ================= Split-K batched (atomicAdd to Y) =================
 template<int TK=1024, int TB=4, bool VEC4=true>
-__global__ void k_gemv_batched_wave_row_shared_splitK_bf16(const hip_bfloat16* __restrict__ W, // BF16
-                                                      const float*       __restrict__ X,
-                                                      float*             __restrict__ Y, // atomicAdd
-                                                      int K, int M, int B, int splitK)
+__global__ void k_gemv_batched_wave_row_shared_splitK_bf16(
+    const hip_bfloat16* __restrict__ W, // [M,K] (BF16)
+    const float*       __restrict__ X,  // [B,K] (F32)
+    float*             __restrict__ Y,  // [B,M] (F32) atomicAdd
+    int K, int M, int B, int splitK)
 {
   extern __shared__ float s[];
   float* X0 = s;
@@ -656,8 +652,8 @@ __global__ void k_gemv_batched_wave_row_shared_splitK_bf16(const hip_bfloat16* _
   const int lane = lane_id();
   const int waves_per_block = blockDim.x / WARP_SIZE;
 
-  const int b0 = blockIdx.y * TB;
-  const int m0 = blockIdx.x * waves_per_block;
+  const int b0   = blockIdx.y * TB;
+  const int m0   = blockIdx.x * waves_per_block;
   const int part = blockIdx.z;
 
   const int span    = dceil_div(K, splitK);
@@ -683,52 +679,7 @@ __global__ void k_gemv_batched_wave_row_shared_splitK_bf16(const hip_bfloat16* _
 
   // Preload first X tile
   int k0 = k_begin;
-  {
-    const int k_lim = dmin(TK, k_end - k0);
-    const bool vec4_ok = VEC4 && stride16 && ((k0 & 3) == 0) && (k_lim >= 4) && X_base16;
-
-    if (vec4_ok){
-      const int cols4  = (k_lim >> 2);
-      const int total4 = TB * cols4;
-      for (int idx4 = tidLinear; idx4 < total4; idx4 += threadsPerBlock){
-        int tb  = idx4 / cols4;
-        int tk4 = idx4 - tb * cols4;
-        int gb  = b0 + tb;
-        int gk  = k0 + (tk4 << 2);
-        Float4 v = {0,0,0,0};
-        if (gb < B){
-          const Float4* px = reinterpret_cast<const Float4*>(X + (size_t)gb * K + gk);
-          v = *px;
-        }
-        const int base = tb * TK + (tk4<<2);
-        if (0 <  k_lim) X0[base + 0] = v.x;
-        if (1 <  k_lim) X0[base + 1] = v.y;
-        if (2 <  k_lim) X0[base + 2] = v.z;
-        if (3 <  k_lim) X0[base + 3] = v.w;
-      }
-      const int vec_end = (cols4 << 2);
-      const int tail    = k_lim - vec_end;
-      if (tail){
-        const int span2 = TB * tail;
-        for (int idx = tidLinear; idx < span2; idx += threadsPerBlock){
-          int tb = idx / tail;
-          int tk = idx - tb * tail;
-          int gb = b0 + tb;
-          int gk = k0 + vec_end + tk;
-          X0[tb * TK + (vec_end + tk)] = (gb < B) ? X[(size_t)gb * K + gk] : 0.0f;
-        }
-      }
-    } else {
-      const int span2 = TB * k_lim;
-      for (int idx = tidLinear; idx < span2; idx += threadsPerBlock){
-        int tb = idx / k_lim;
-        int tk = idx - tb * k_lim;
-        int gb = b0 + tb;
-        int gk = k0 + tk;
-        X0[tb * TK + tk] = (gb < B) ? X[(size_t)gb * K + gk] : 0.0f;
-      }
-    }
-  }
+  preload_X_tile<VEC4>((float*)X0, X, b0, TK, K, k0, B, TB, threadsPerBlock, tidLinear, X_base16);
   __syncthreads();
 
   // Main loop within this K-slice
@@ -743,18 +694,19 @@ __global__ void k_gemv_batched_wave_row_shared_splitK_bf16(const hip_bfloat16* _
 
       if (VEC4 && smem_aligned16 && W_base16 && stride16 && ((k0 & 3) == 0) && (k_lim >= 4)){
         const int vec_end = (k_lim >> 2) << 2;
+
+        #pragma unroll 2
         for (int jj = lane * 4; jj < vec_end; jj += 4 * WARP_SIZE){
-          const Float4* __restrict__ x4 = reinterpret_cast<const Float4*>(xrow + jj);
-          Float4 b = *x4;
-          float a0 = bf16_to_float(wrow[jj+0]);
-          float a1 = bf16_to_float(wrow[jj+1]);
-          float a2 = bf16_to_float(wrow[jj+2]);
-          float a3 = bf16_to_float(wrow[jj+3]);
-          acc = fmaf(a0, b.x, acc);
-          acc = fmaf(a1, b.y, acc);
-          acc = fmaf(a2, b.z, acc);
-          acc = fmaf(a3, b.w, acc);
+          const Float4* __restrict__ x4p = reinterpret_cast<const Float4*>(xrow + jj);
+          Float4 xb = *x4p;
+          Float4 aw = ld_bf16x4_to_f32x4(wrow + jj);
+
+          acc = fmaf(aw.x, xb.x, acc);
+          acc = fmaf(aw.y, xb.y, acc);
+          acc = fmaf(aw.z, xb.z, acc);
+          acc = fmaf(aw.w, xb.w, acc);
         }
+        // tail
         for (int jj = ((k_lim>>2)<<2) + lane; jj < k_lim; jj += WARP_SIZE){
           acc = fmaf(bf16_to_float(wrow[jj]), xrow[jj], acc);
         }
@@ -769,52 +721,8 @@ __global__ void k_gemv_batched_wave_row_shared_splitK_bf16(const hip_bfloat16* _
     // Preload next X tile for this K-slice
     const int next_k0 = k0 + TK;
     if (next_k0 < k_end){
-      const int next_lim = dmin(TK, k_end - next_k0);
-      const bool vec4_ok = VEC4 && stride16 && ((next_k0 & 3) == 0) && (next_lim >= 4) && X_base16;
-
-      if (vec4_ok){
-        const int cols4  = (next_lim >> 2);
-        const int total4 = TB * cols4;
-        for (int idx4 = tidLinear; idx4 < total4; idx4 += threadsPerBlock){
-          int tb  = idx4 / cols4;
-          int tk4 = idx4 - tb * cols4;
-          int gb  = b0 + tb;
-          int gk  = next_k0 + (tk4 << 2);
-          Float4 v = {0,0,0,0};
-          if (gb < B){
-            const Float4* px = reinterpret_cast<const Float4*>(X + (size_t)gb * K + gk);
-            v = *px;
-          }
-          const int base = tb * TK + (tk4<<2);
-          x_nxt[base + 0] = v.x;
-          x_nxt[base + 1] = v.y;
-          x_nxt[base + 2] = v.z;
-          x_nxt[base + 3] = v.w;
-        }
-        const int vec_end = (cols4 << 2);
-        const int tail    = next_lim - vec_end;
-        if (tail){
-          const int span2 = TB * tail;
-          for (int idx = tidLinear; idx < span2; idx += threadsPerBlock){
-            int tb = idx / tail;
-            int tk = idx - tb * tail;
-            int gb = b0 + tb;
-            int gk = next_k0 + vec_end + tk;
-            x_nxt[tb * TK + (vec_end + tk)] = (gb < B) ? X[(size_t)gb * K + gk] : 0.0f;
-          }
-        }
-      } else {
-        const int span2 = TB * next_lim;
-        for (int idx = tidLinear; idx < span2; idx += threadsPerBlock){
-          int tb = idx / next_lim;
-          int tk = idx - tb * next_lim;
-          int gb = b0 + tb;
-          int gk = next_k0 + tk;
-          x_nxt[tb * TK + tk] = (gb < B) ? X[(size_t)gb * K + gk] : 0.0f;
-        }
-      }
+      preload_X_tile<VEC4>((float*)x_nxt, X, b0, TK, K, next_k0, B, TB, threadsPerBlock, tidLinear, X_base16);
     }
-
     __syncthreads();
   }
 
@@ -828,10 +736,11 @@ __global__ void k_gemv_batched_wave_row_shared_splitK_bf16(const hip_bfloat16* _
 // ============================== Launchers ==============================
 
 template<int TK=1024, int TB=4, bool VEC4=true>
-static inline void gemv_gpu_batch_opt_bf16(float* Y, const float* X, const hip_bfloat16* W,
-                                      int K, int M, int B,
-                                      int waves_per_block = 4,
-                                      hipStream_t stream = 0)
+static inline void gemv_gpu_batch_opt_bf16(
+    float* Y, const float* X, const hip_bfloat16* W,
+    int K, int M, int B,
+    int waves_per_block = 4,
+    hipStream_t stream = 0)
 {
   const int threads_x = waves_per_block * WARP_SIZE;
   const int threads_y = TB;
@@ -839,12 +748,15 @@ static inline void gemv_gpu_batch_opt_bf16(float* Y, const float* X, const hip_b
   if (threads_per_block > 1024){
     int newTB = 1024 / (waves_per_block * WARP_SIZE);
     if (newTB < 1) newTB = 1;
-    printf("[gemv_gpu_batch_opt] Adjusting TB from %d to %d to satisfy 1024-thread limit.\n", TB, newTB);
+    fprintf(stderr,
+      "[gemv_gpu_batch_opt_bf16] Warning: block size %d exceeds 1024. "
+      "Recompile with smaller TB or fewer waves_per_block (TB=%d, waves=%d)\n",
+      threads_per_block, newTB, waves_per_block);
   }
 
   dim3 block(threads_x, threads_y, 1);
-  dim3 grid((M + waves_per_block - 1) / waves_per_block,
-            (B + TB - 1) / TB,
+  dim3 grid(ceil_div(M, waves_per_block),
+            ceil_div(B, TB),
             1);
   size_t shmem = 2ULL * TB * TK * sizeof(float);
 
@@ -854,21 +766,22 @@ static inline void gemv_gpu_batch_opt_bf16(float* Y, const float* X, const hip_b
 }
 
 template<int TK=1024, int TB=4, bool VEC4=true>
-static inline void gemv_gpu_batch_opt_splitK_bf16(float* Y, const float* X, const hip_bfloat16* W,
-                                             int K, int M, int B,
-                                             int splitK,
-                                             int waves_per_block = 4,
-                                             hipStream_t stream = 0)
+static inline void gemv_gpu_batch_opt_splitK_bf16(
+    float* Y, const float* X, const hip_bfloat16* W,
+    int K, int M, int B,
+    int splitK,
+    int waves_per_block = 4,
+    hipStream_t stream = 0)
 {
   const int threads_x = waves_per_block * WARP_SIZE;
   const int threads_y = TB;
   dim3 block(threads_x, threads_y, 1);
-  dim3 grid((M + waves_per_block - 1) / waves_per_block,
-            (B + TB - 1) / TB,
+  dim3 grid(ceil_div(M, waves_per_block),
+            ceil_div(B, TB),
             splitK);
   size_t shmem = 2ULL * TB * TK * sizeof(float);
 
-  hipMemsetAsync(Y, 0, (size_t)B * M * sizeof(float), stream);
+  HIP_CHECK( hipMemsetAsync(Y, 0, (size_t)B * M * sizeof(float), stream) );
 
   hipLaunchKernelGGL((k_gemv_batched_wave_row_shared_splitK_bf16<TK,TB,VEC4>),
                      grid, block, shmem, stream,
@@ -876,10 +789,12 @@ static inline void gemv_gpu_batch_opt_splitK_bf16(float* Y, const float* X, cons
 }
 
 // ============================== Heuristic wrapper ==============================
-static inline void gemv_gpu_batch_bf16(float* Y, const float* X, const hip_bfloat16* W,
-                                  int K, int M, int B,
-                                  hipStream_t stream = 0)
+static inline void gemv_gpu_batch_bf16(
+    float* Y, const float* X, const hip_bfloat16* W,
+    int K, int M, int B,
+    hipStream_t stream = 0)
 {
+  // Prefer large TK for bandwidth efficiency; keep multiple of 32.
   constexpr int TK = 2048;
   constexpr int TB = 4;
   const int waves_per_block = 4;
