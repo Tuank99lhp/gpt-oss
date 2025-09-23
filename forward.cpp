@@ -69,7 +69,7 @@ void forward_batch(Transformer *transformer, int batch_size) {
       hidden_dim
     );
 
-    gemv_gpu_batch(
+    gemm_gpu_batch_f32W(
       g_batch_state->batch_qkv, 
       g_batch_state->batch_t,  
       w->w_qkv + 1ll * l * hidden_dim * (head_dim * n_qkv_heads),
@@ -154,7 +154,7 @@ void forward_batch(Transformer *transformer, int batch_size) {
     const float *Wo = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
     const float *Bo = w->b_o + 1ll * l * hidden_dim;
 
-    gemv_gpu_batch(
+    gemm_gpu_batch_f32W(
       g_batch_state->batch_tb2,
       g_batch_state->batch_tb,
       Wo,
@@ -187,7 +187,7 @@ void forward_batch(Transformer *transformer, int batch_size) {
         batch_size, hidden_dim
       );
 
-      gemv_gpu_batch(
+      gemm_gpu_batch_f32W(
         g_batch_state->batch_router_score,
         g_batch_state->batch_t,
         w->w_router + l * hidden_dim * p->n_experts,
@@ -256,7 +256,7 @@ void forward_batch(Transformer *transformer, int batch_size) {
           const hip_bfloat16 *W1_local = d_w_mlp1_bf16 + offset_l * mlp1_per; 
           const float *B1_local = w->b_mlp1 + offset_l * (2 * I);
 
-          gemv_gpu_batch_bf16(ds.batch_mlp1_out, ds.batch_t, W1_local, H, 2 * I, B);
+          gemm_gpu_batch_bf16(ds.batch_mlp1_out, ds.batch_t, W1_local, H, 2 * I, B);
           add_bias_gpu_batch_broadcast(ds.batch_mlp1_out, B1_local, B, 2 * I);
 
           split_gate_up(ds.batch_mlp1_out, ds.batch_gate, ds.batch_up, I * B);
@@ -266,7 +266,7 @@ void forward_batch(Transformer *transformer, int batch_size) {
           const hip_bfloat16 *W2_local = d_w_mlp2_bf16 + offset_l * mlp2_per;
           const float *B2_local = w->b_mlp2 + offset_l * H;
 
-          gemv_gpu_batch_bf16(ds.batch_t, ds.batch_gate_up, W2_local, I, H, B);
+          gemm_gpu_batch_bf16(ds.batch_t, ds.batch_gate_up, W2_local, I, H, B);
           add_bias_gpu_batch_broadcast(ds.batch_t, B2_local, B, H);
 
           HIP_CHECK(hipMemcpy(ds.batch_wexps, ds.host_wexps, B * sizeof(float), hipMemcpyHostToDevice));
@@ -296,7 +296,7 @@ void forward_batch(Transformer *transformer, int batch_size) {
     hidden_dim
   );
 
-  gemv_gpu_batch(
+  gemm_gpu_batch_f32W(
     g_batch_state->batch_logits,
     g_batch_state->batch_x,
     w->out,

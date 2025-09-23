@@ -105,6 +105,27 @@ static void to_device(float **dptr, const float *hptr, size_t nbytes) {
   HIP_CHECK(hipMemcpy(*dptr, hptr, nbytes, hipMemcpyHostToDevice));
 }
 
+static void to_device_and_transpose(float **dptr, const float *hptr, int n, int rows, int cols) {
+  long long total_elems = 1ll * n * rows * cols;
+  HIP_CHECK(hipMalloc((void**)dptr, total_elems * sizeof(float)));
+  float *tmp = (float*)malloc(total_elems * sizeof(float));
+
+  // transpose
+  #pragma omp parallel for
+  for (int i = 0; i < n; i++) {
+    const float *s = hptr + (long long)i * rows * cols;
+    float *d = tmp + (long long)i * rows * cols;
+    for (int r = 0; r < rows; r++) {
+      for (int c = 0; c < cols; c++) {
+        d[c * rows + r] = s[r * cols + c];
+      }
+    }
+  }
+
+  HIP_CHECK(hipMemcpy(*dptr, tmp, total_elems * sizeof(float), hipMemcpyHostToDevice));
+  free(tmp);
+}
+
 static void alloc_device(float **dptr, size_t nbytes, float fill=0.f, bool do_set=false) {
   HIP_CHECK(hipMalloc((void**)dptr, nbytes));
   if (do_set) {
@@ -158,7 +179,10 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
 
   to_device(&w->token_embedding_table, ptr, 1ll*cfg->vocab_size*cfg->hidden_dim*sizeof(float));
   ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
-  to_device(&w->out, ptr, 1ll*cfg->vocab_size*cfg->hidden_dim*sizeof(float));
+
+  // to_device(&w->out, ptr, 1ll*cfg->vocab_size*cfg->hidden_dim*sizeof(float));
+  to_device_and_transpose(&w->out, ptr, 1, cfg->vocab_size, cfg->hidden_dim);
+
   ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
   to_device(&w->rms_attn_w, ptr, 1ll * n_layers * cfg->hidden_dim * sizeof(float));
   ptr += 1ll * n_layers * cfg->hidden_dim;
@@ -167,10 +191,14 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
   to_device(&w->rms_out_w, ptr, 1ll * cfg->hidden_dim * sizeof(float));
   ptr += 1ll * cfg->hidden_dim;
   // hey it's qkvqkv, not qqkkvv
-  to_device(&w->w_qkv, ptr,
-            1ll * n_layers * cfg->hidden_dim *
-            (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads) *
-            sizeof(float));
+  // to_device(&w->w_qkv, ptr,
+  //           1ll * n_layers * cfg->hidden_dim *
+  //           (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads) *
+  //           sizeof(float));
+  to_device_and_transpose(&w->w_qkv, ptr, n_layers,
+                          head_dim * (cfg->n_attn_heads + 2 * cfg->n_kv_heads), 
+                          cfg->hidden_dim);
+  
   ptr += 1ll * n_layers * cfg->hidden_dim *
          (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
   to_device(&w->b_qkv, ptr,
@@ -178,15 +206,23 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
             sizeof(float));
   ptr += 1ll * n_layers *
          (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
-  to_device(&w->w_o, ptr,
-            1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim *
-            sizeof(float));
+
+  // to_device(&w->w_o, ptr,
+  //           1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim *
+  //           sizeof(float));
+  to_device_and_transpose(&w->w_o, ptr, n_layers,
+                          cfg->hidden_dim,
+                          head_dim * cfg->n_attn_heads);
+
   ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
   to_device(&w->b_o, ptr, 1ll * n_layers * cfg->hidden_dim * sizeof(float));
   ptr += 1ll * n_layers * cfg->hidden_dim;
   to_device(&w->attn_sinks, ptr, 1ll * n_layers * cfg->n_attn_heads * sizeof(float));
   ptr += 1ll * n_layers * cfg->n_attn_heads;
-  to_device(&w->w_router, ptr, 1ll * n_layers * cfg->hidden_dim * n_experts * sizeof(float));
+
+  // to_device(&w->w_router, ptr, 1ll * n_layers * cfg->hidden_dim * n_experts * sizeof(float));
+  to_device_and_transpose(&w->w_router, ptr, n_layers, n_experts, cfg->hidden_dim);
+
   ptr += 1ll * n_layers * cfg->hidden_dim * n_experts;
   to_device(&w->b_router, ptr, 1ll * n_layers * n_experts * sizeof(float));
   ptr += 1ll * n_layers * n_experts;
@@ -199,8 +235,8 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
       exit(1);
   }
 
-  convert_fp32_to_bf16_host(ptr, tmp, elems_w_mlp1);
-  // convert_fp32_to_bf16_host_and_transpose(ptr, tmp, n_layers * n_experts, 2 * cfg->intermediate_dim, cfg->hidden_dim);
+  // convert_fp32_to_bf16_host(ptr, tmp, elems_w_mlp1);
+  convert_fp32_to_bf16_host_and_transpose(ptr, tmp, n_layers * n_experts, 2 * cfg->intermediate_dim, cfg->hidden_dim);
 
   HIP_CHECK(hipMalloc(&g_batch_state->d_w_mlp1_bf16, elems_w_mlp1 * sizeof(hip_bfloat16)));
   HIP_CHECK(hipMemcpy(g_batch_state->d_w_mlp1_bf16, tmp, elems_w_mlp1 * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
@@ -212,8 +248,8 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
 
   long long elems_w_mlp2 = 1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
 
-  convert_fp32_to_bf16_host(ptr, tmp, elems_w_mlp2);
-  // convert_fp32_to_bf16_host_and_transpose(ptr, tmp, n_layers * n_experts, cfg->hidden_dim, cfg->intermediate_dim);
+  // convert_fp32_to_bf16_host(ptr, tmp, elems_w_mlp2);
+  convert_fp32_to_bf16_host_and_transpose(ptr, tmp, n_layers * n_experts, cfg->hidden_dim, cfg->intermediate_dim);
 
   HIP_CHECK(hipMalloc(&g_batch_state->d_w_mlp2_bf16, elems_w_mlp2 * sizeof(hip_bfloat16)));
   HIP_CHECK(hipMemcpy(g_batch_state->d_w_mlp2_bf16, tmp, elems_w_mlp2 * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
