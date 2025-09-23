@@ -9,6 +9,23 @@
 #define GETP_RUN
 
 typedef struct {
+
+    float* batch_t;              // [max_batch_size, hidden_dim]
+
+    float* batch_mlp1_out;       // [max_batch_size, 2 * intermediate_dim]
+    float* batch_gate;           // [max_batch_size, intermediate_dim]
+    float* batch_up;             // [max_batch_size, intermediate_dim]
+    float* batch_gate_up;        // [max_batch_size, intermediate_dim]
+
+    float* batch_wexps;
+    float* host_wexps;
+
+    int* idx_in_batch;
+    int num_batch;
+
+} BatchStateMOE;
+
+typedef struct {
     // ==== Per-request state (host) ====
     int* positions;              // [batch_size]  vị trí hiện tại của từng sequence
     int* num_prompt_tokens;      // [batch_size]  độ dài prompt của từng sequence
@@ -48,41 +65,35 @@ typedef struct {
     int*   batch_topk_i;         // [max_batch_size, experts_per_token]
 
     float* mask;
+
+    int* h_topk_i;
+    float* h_topk_v;
+
+    int* d_current_tokens;
+    int* d_positions;
+    float* cosB;
+    float* sinB;
+
+    float* h_p;
+
+    hip_bfloat16* d_w_mlp1_bf16;
+    hip_bfloat16* d_w_mlp2_bf16;
+    
+    // ======= Bộ nhớ cache inv_freq (tạo 1 lần, dùng lại) =======
+    float* g_inv_freq_dev; // [half] on device
+    float* d_conc;
+    int    g_cached_hd    = 0;
+    float  g_cached_base  = 0.f, g_cached_scale = 0.f, g_cached_ic = 0.f, g_cached_b = 0.f, g_cached_a = 0.f;
+    float  g_concentration = 1.f;
+
+    BatchStateMOE* MOE_tmp_batch_state;
+
 } BatchState;
 
-typedef struct {
-
-    float* batch_t;              // [max_batch_size, hidden_dim]
-
-    float* batch_mlp1_out;       // [max_batch_size, 2 * intermediate_dim]
-    float* batch_gate;           // [max_batch_size, intermediate_dim]
-    float* batch_up;             // [max_batch_size, intermediate_dim]
-    float* batch_gate_up;        // [max_batch_size, intermediate_dim]
-
-    float* batch_wexps;
-    float* host_wexps;
-
-    int *idx_in_batch;
-    int num_batch;
-
-} BatchStateMOE;
-
+int NUM_GPUS = 8;
 const int MAX_BATCH_SIZE = 64;
-BatchState* g_batch_state = NULL;
-BatchStateMOE* MOE_tmp_batch_state = NULL;
-
-int   *h_topk_i = nullptr;
-float *h_topk_v = nullptr;
-
-int   *d_current_tokens = nullptr;
-int   *d_positions = nullptr;
-float *cosB = nullptr;
-float *sinB = nullptr;
-
-float *h_p = nullptr;
-
-hip_bfloat16 *d_w_mlp1_bf16 = nullptr;
-hip_bfloat16 *d_w_mlp2_bf16 = nullptr;
+BatchState* batch_states = NULL;
+TransformerWeights* transformer_weights = NULL;
 
 #include "../forward.cpp"
 #include "../sample.cpp"
@@ -121,12 +132,26 @@ void free_int_device(int *&p) {
 static void convert_fp32_to_bf16_host(const float *src, hip_bfloat16 *dst, long long N) {
   #pragma omp parallel for
   for (long long i = 0; i < N; i++) {
-      dst[i] = static_cast<hip_bfloat16>(src[i]);
+      dst[i] = hip_bfloat16(src[i]);
       // if (i < 1000) printf("Converting fp32 to bf16: %.32f -> %.32f\n", src[i], (float)dst[i]);
   }
 }
 
-void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr) {
+static void convert_fp32_to_bf16_host_and_transpose(const float *src, hip_bfloat16 *dst, int n, int rows, int cols) {
+  // src: [n, rows, cols] -> dst: [n, cols, rows]
+  #pragma omp parallel for
+  for (int i = 0; i < n; i++) {
+    const float *s = src + (long long)i * rows * cols;
+    hip_bfloat16 *d = dst + (long long)i * rows * cols;
+    for (int r = 0; r < rows; r++) {
+      for (int c = 0; c < cols; c++) {
+        d[c * rows + r] = hip_bfloat16(s[r * cols + c]);
+      }
+    }
+  }
+}
+
+void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, BatchState *g_batch_state) {
   int head_dim = cfg->head_dim;
   int n_layers = cfg->n_layers;
   int n_experts = cfg->n_experts;
@@ -175,9 +200,10 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr) {
   }
 
   convert_fp32_to_bf16_host(ptr, tmp, elems_w_mlp1);
+  // convert_fp32_to_bf16_host_and_transpose(ptr, tmp, n_layers * n_experts, 2 * cfg->intermediate_dim, cfg->hidden_dim);
 
-  HIP_CHECK(hipMalloc(&d_w_mlp1_bf16, elems_w_mlp1 * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMemcpy(d_w_mlp1_bf16, tmp, elems_w_mlp1 * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&g_batch_state->d_w_mlp1_bf16, elems_w_mlp1 * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMemcpy(g_batch_state->d_w_mlp1_bf16, tmp, elems_w_mlp1 * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
 
   ptr += elems_w_mlp1;
   
@@ -187,9 +213,10 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr) {
   long long elems_w_mlp2 = 1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
 
   convert_fp32_to_bf16_host(ptr, tmp, elems_w_mlp2);
+  // convert_fp32_to_bf16_host_and_transpose(ptr, tmp, n_layers * n_experts, cfg->hidden_dim, cfg->intermediate_dim);
 
-  HIP_CHECK(hipMalloc(&d_w_mlp2_bf16, elems_w_mlp2 * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMemcpy(d_w_mlp2_bf16, tmp, elems_w_mlp2 * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&g_batch_state->d_w_mlp2_bf16, elems_w_mlp2 * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMemcpy(g_batch_state->d_w_mlp2_bf16, tmp, elems_w_mlp2 * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
 
   ptr += elems_w_mlp2;
   
@@ -199,14 +226,7 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr) {
   ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
 }
 
-static void build_transformer_gpu(Transformer *T) {
-  float *weights_ptr = T->data + sizeof(T->config) / sizeof(float);
-  memory_map_weights_gpu(&T->weights, &T->config, weights_ptr);
-}
-
-static void free_transformer_gpu(Transformer *T) {
-  TransformerWeights &w = T->weights;
-  
+static void free_weights_gpu(TransformerWeights &w, BatchState *g_batch_state) {
   free_float_device(w.token_embedding_table); 
   
   free_float_device(w.rms_attn_w); 
@@ -232,14 +252,14 @@ static void free_transformer_gpu(Transformer *T) {
   free_float_device(w.rms_out_w); 
   free_float_device(w.out);
 
-  if (d_w_mlp1_bf16) {
-    hipFree(d_w_mlp1_bf16);
-    d_w_mlp1_bf16 = nullptr;
+  if (g_batch_state->d_w_mlp1_bf16) {
+    hipFree(g_batch_state->d_w_mlp1_bf16);
+    g_batch_state->d_w_mlp1_bf16 = nullptr;
   }
 
-  if (d_w_mlp2_bf16) {
-    hipFree(d_w_mlp2_bf16);
-    d_w_mlp2_bf16 = nullptr;
+  if (g_batch_state->d_w_mlp2_bf16) {
+    hipFree(g_batch_state->d_w_mlp2_bf16);
+    g_batch_state->d_w_mlp2_bf16 = nullptr;
   }
 }
 
@@ -429,32 +449,42 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
-  build_transformer_gpu(transformer);
   
   Config &c = transformer->config;
   
-  g_batch_state = (BatchState*)malloc(sizeof(BatchState));
-  alloc_batchstate_on_device(*g_batch_state, c);
+  batch_states = (BatchState*)malloc(NUM_GPUS * sizeof(BatchState));
+  transformer_weights = (TransformerWeights*)malloc(NUM_GPUS * sizeof(TransformerWeights));
 
-  MOE_tmp_batch_state = (BatchStateMOE*)malloc(c.n_experts * sizeof(BatchStateMOE));
-  for (int i = 0; i < c.n_experts; ++i) {
-    alloc_batchstate_moe_on_device(MOE_tmp_batch_state[i], c);
-  }
+  #pragma omp parallel for num_threads(NUM_GPUS)
+  for (int i = 0; i < NUM_GPUS; ++i) {
+    HIP_CHECK(hipSetDevice(i));
+    BatchState *g_batch_state = &batch_states[i];
 
-  h_topk_i = (int*)  malloc(MAX_BATCH_SIZE * c.experts_per_token * sizeof(int));
-  h_topk_v = (float*)malloc(MAX_BATCH_SIZE * c.experts_per_token * sizeof(float));
+    float *weights_ptr = transformer->data + sizeof(c) / sizeof(float);
+    memory_map_weights_gpu(&transformer_weights[i], &c, weights_ptr, g_batch_state);
 
-  HIP_CHECK(hipMalloc(&d_current_tokens, MAX_BATCH_SIZE * sizeof(int)));
-  HIP_CHECK(hipMalloc(&d_positions, MAX_BATCH_SIZE * sizeof(int)));
-  
-  const int half = c.head_dim / 2;
-  HIP_CHECK(hipMalloc(&cosB, MAX_BATCH_SIZE * half * sizeof(float)));
-  HIP_CHECK(hipMalloc(&sinB, MAX_BATCH_SIZE * half * sizeof(float)));
+    alloc_batchstate_on_device(*g_batch_state, c);
 
-  h_p = (float*)malloc(c.vocab_size * sizeof(float));
+    g_batch_state->h_topk_i = (int*)  malloc(MAX_BATCH_SIZE * c.experts_per_token * sizeof(int));
+    g_batch_state->h_topk_v = (float*)malloc(MAX_BATCH_SIZE * c.experts_per_token * sizeof(float));
+
+    HIP_CHECK(hipMalloc(&g_batch_state->d_current_tokens, MAX_BATCH_SIZE * sizeof(int)));
+    HIP_CHECK(hipMalloc(&g_batch_state->d_positions, MAX_BATCH_SIZE * sizeof(int)));
     
-  HIP_CHECK(hipMalloc(&g_inv_freq_dev, half * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_conc, sizeof(float)));
+    const int half = c.head_dim / 2;
+    HIP_CHECK(hipMalloc(&g_batch_state->cosB, MAX_BATCH_SIZE * half * sizeof(float)));
+    HIP_CHECK(hipMalloc(&g_batch_state->sinB, MAX_BATCH_SIZE * half * sizeof(float)));
+
+    g_batch_state->h_p = (float*)malloc(c.vocab_size * sizeof(float));
+      
+    HIP_CHECK(hipMalloc(&g_batch_state->g_inv_freq_dev, half * sizeof(float)));
+    HIP_CHECK(hipMalloc(&g_batch_state->d_conc, sizeof(float)));
+
+    g_batch_state->MOE_tmp_batch_state = (BatchStateMOE*)malloc(c.n_experts * sizeof(BatchStateMOE));
+    for (int i = 0; i < c.n_experts; ++i) {
+      alloc_batchstate_moe_on_device(g_batch_state->MOE_tmp_batch_state[i], c);
+    }
+  }
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -464,134 +494,163 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
-  free_transformer_gpu(transformer);
+  #pragma omp parallel for num_threads(NUM_GPUS)
+  for (int i = 0; i < NUM_GPUS; ++i) {
+    HIP_CHECK(hipSetDevice(i));
+    BatchState *g_batch_state = &batch_states[i];
 
-  free_batchstate_on_device(*g_batch_state);
-  free(g_batch_state); 
-  g_batch_state = NULL;
+    free_weights_gpu(transformer_weights[i], g_batch_state);
 
-  for (int i = 0; i < transformer->config.n_experts; ++i) {
-    free_batchstate_moe_on_device(MOE_tmp_batch_state[i]);
+    free_batchstate_on_device(*g_batch_state);
+    
+    if (g_batch_state->h_topk_i) {
+      free(g_batch_state->h_topk_i);
+      g_batch_state->h_topk_i = nullptr;
+    }
+    if (g_batch_state->h_topk_v) {
+      free(g_batch_state->h_topk_v);
+      g_batch_state->h_topk_v = nullptr;
+    }
+
+    HIP_CHECK(hipFree(g_batch_state->d_current_tokens));
+    HIP_CHECK(hipFree(g_batch_state->d_positions));
+    HIP_CHECK(hipFree(g_batch_state->cosB));
+    HIP_CHECK(hipFree(g_batch_state->sinB));
+
+    free(g_batch_state->h_p);
+
+    HIP_CHECK(hipFree(g_batch_state->g_inv_freq_dev));
+    HIP_CHECK(hipFree(g_batch_state->d_conc));
+
+    for (int i = 0; i < transformer->config.n_experts; ++i) {
+      free_batchstate_moe_on_device(g_batch_state->MOE_tmp_batch_state[i]);
+    }
+    free(g_batch_state->MOE_tmp_batch_state); 
+    g_batch_state->MOE_tmp_batch_state = NULL;
   }
-  free(MOE_tmp_batch_state); 
-  MOE_tmp_batch_state = NULL;
-  
-  if (h_topk_i) {
-    free(h_topk_i);
-    h_topk_i = nullptr;
-  }
-  if (h_topk_v) {
-    free(h_topk_v);
-    h_topk_v = nullptr;
-  }
 
-  HIP_CHECK(hipFree(d_current_tokens));
-  HIP_CHECK(hipFree(d_positions));
-  HIP_CHECK(hipFree(cosB));
-  HIP_CHECK(hipFree(sinB));
+  free(transformer_weights);
+  transformer_weights = NULL;
 
-  free(h_p);
-
-  HIP_CHECK(hipFree(g_inv_freq_dev));
-  HIP_CHECK(hipFree(d_conc));
+  free(batch_states); 
+  batch_states = NULL;
 }
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
   long long num_token_out = 0;
+  int div = requests->num_reqs / NUM_GPUS;
+  int mod = requests->num_reqs % NUM_GPUS;
   
-  const int num_reqs = requests->num_reqs;
-  const int max_steps = requests->max_seq_len;
-  const int batch_size = (num_reqs < MAX_BATCH_SIZE) ? num_reqs : MAX_BATCH_SIZE;
+  #pragma omp parallel for num_threads(NUM_GPUS)
+  for (int d = 0; d < NUM_GPUS; d++) {
+    HIP_CHECK(hipSetDevice(d));
 
-  for (int i = 0; i < batch_size; ++i) {
-    const char *input_seq = get_str_req_ptr(requests, i);
+    BatchState *g_batch_state = &batch_states[d];
+    long long num_token_out_local = 0;
+  
+    const int num_reqs = div + (mod > d);
+    assert(num_reqs > 0);
 
-    g_batch_state->prompt_tokens[i] =
-        (int*)malloc((strlen(input_seq) + 3) * sizeof(int));
-    g_batch_state->num_prompt_tokens[i] = 0;
-
-    encode(tokenizer, input_seq, -1, -1,
-            g_batch_state->prompt_tokens[i],
-            &g_batch_state->num_prompt_tokens[i],
-            transformer->config.initial_context_length);
-
-    g_batch_state->positions[i] = 0;
-    g_batch_state->current_tokens[i] = g_batch_state->prompt_tokens[i][0];
-    g_batch_state->finished[i] = false;
-    g_batch_state->req_ids[i] = i;
-  }
-
-  int active_count = batch_size;
-  int req_it = batch_size;
-
-  while (active_count) {
-    forward_batch(transformer, batch_size);
-
+    int start_req = div * d + (d < mod ? d : mod);
+    
+    const int max_steps = requests->max_seq_len;
+    const int batch_size = (num_reqs < MAX_BATCH_SIZE) ? num_reqs : MAX_BATCH_SIZE;
+    
     for (int i = 0; i < batch_size; ++i) {
-      if (g_batch_state->finished[i]) {
-        continue;
-      }
-      
-      int pos     = ++g_batch_state->positions[i];
-      int req_idx = g_batch_state->req_ids[i];
+      const char *input_seq = get_str_req_ptr(requests, start_req + i);
 
-      int next_token;
-      if (pos < g_batch_state->num_prompt_tokens[i]) {
-        next_token = g_batch_state->prompt_tokens[i][pos];
-      } else {
+      g_batch_state->prompt_tokens[i] =
+          (int*)malloc((strlen(input_seq) + 3) * sizeof(int));
+      g_batch_state->num_prompt_tokens[i] = 0;
 
-        next_token = sample_gpu(sampler, g_batch_state->logits_batch[i]);
+      encode(tokenizer, input_seq, -1, -1,
+              g_batch_state->prompt_tokens[i],
+              &g_batch_state->num_prompt_tokens[i],
+              transformer->config.initial_context_length);
 
-        int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-        int out_pos = pos - g_batch_state->num_prompt_tokens[i];
-        output_tokens[out_pos] = next_token;
-      }
-
-      const char *piece = decode_piece(tokenizer, g_batch_state->current_tokens[i], next_token);
-      safe_printf(piece);
-      fflush(stdout);
-
-      g_batch_state->current_tokens[i] = next_token;
-
-      if (next_token == 199999 || next_token == 200002 || pos >= max_steps) {
-        g_batch_state->finished[i] = true;
-        free(g_batch_state->prompt_tokens[i]);
-        g_batch_state->prompt_tokens[i] = nullptr;
-        active_count--;
-
-        int *output_tokens = get_tok_gen_ptr(requests, req_idx);
-        int out_len = pos - g_batch_state->num_prompt_tokens[i] + 1;
-        assert(out_len >= 0);
-        output_tokens[out_len] = -1;
-
-        num_token_out += out_len;
-
-        if (req_it < num_reqs) {
-          // load new request
-          const char *input_seq = get_str_req_ptr(requests, req_it);
-
-          g_batch_state->prompt_tokens[i] =
-              (int*)malloc((strlen(input_seq) + 3) * sizeof(int));
-          g_batch_state->num_prompt_tokens[i] = 0;
-
-          encode(tokenizer, input_seq, -1, -1,
-                  g_batch_state->prompt_tokens[i],
-                  &g_batch_state->num_prompt_tokens[i],
-                  transformer->config.initial_context_length);
-
-          g_batch_state->positions[i] = 0;
-          g_batch_state->current_tokens[i] = g_batch_state->prompt_tokens[i][0];
-          g_batch_state->finished[i] = false;
-          g_batch_state->req_ids[i] = req_it;
-
-          req_it++;
-          active_count++;
-        }
-      }
+      g_batch_state->positions[i] = 0;
+      g_batch_state->current_tokens[i] = g_batch_state->prompt_tokens[i][0];
+      g_batch_state->finished[i] = false;
+      g_batch_state->req_ids[i] = start_req + i;
     }
 
+    int active_count = batch_size;
+    int req_it = batch_size;
+
+    while (active_count) {
+      forward_batch(transformer, batch_size);
+
+      for (int i = 0; i < batch_size; ++i) {
+        if (g_batch_state->finished[i]) {
+          continue;
+        }
+        
+        int pos     = ++g_batch_state->positions[i];
+        int req_idx = g_batch_state->req_ids[i];
+
+        int next_token;
+        if (pos < g_batch_state->num_prompt_tokens[i]) {
+          next_token = g_batch_state->prompt_tokens[i][pos];
+        } else {
+
+          next_token = sample_gpu(sampler, g_batch_state->logits_batch[i]);
+
+          int *output_tokens = get_tok_gen_ptr(requests, req_idx);
+          int out_pos = pos - g_batch_state->num_prompt_tokens[i];
+          output_tokens[out_pos] = next_token;
+        }
+
+        // const char *piece = decode_piece(tokenizer, g_batch_state->current_tokens[i], next_token);
+        // safe_printf(piece);
+        // fflush(stdout);
+
+        g_batch_state->current_tokens[i] = next_token;
+
+        if (next_token == 199999 || next_token == 200002 || pos >= max_steps) {
+          g_batch_state->finished[i] = true;
+          free(g_batch_state->prompt_tokens[i]);
+          g_batch_state->prompt_tokens[i] = nullptr;
+          active_count--;
+
+          int *output_tokens = get_tok_gen_ptr(requests, req_idx);
+          int out_len = pos - g_batch_state->num_prompt_tokens[i] + 1;
+          assert(out_len >= 0);
+          output_tokens[out_len] = -1;
+
+          num_token_out_local += out_len;
+
+          if (req_it < num_reqs) {
+            // load new request
+            const char *input_seq = get_str_req_ptr(requests, start_req + req_it);
+
+            g_batch_state->prompt_tokens[i] =
+                (int*)malloc((strlen(input_seq) + 3) * sizeof(int));
+            g_batch_state->num_prompt_tokens[i] = 0;
+
+            encode(tokenizer, input_seq, -1, -1,
+                    g_batch_state->prompt_tokens[i],
+                    &g_batch_state->num_prompt_tokens[i],
+                    transformer->config.initial_context_length);
+
+            g_batch_state->positions[i] = 0;
+            g_batch_state->current_tokens[i] = g_batch_state->prompt_tokens[i][0];
+            g_batch_state->finished[i] = false;
+            g_batch_state->req_ids[i] = req_it;
+
+            req_it++;
+            active_count++;
+          }
+        }
+      }
+
+    }
+
+    #pragma omp atomic
+    num_token_out += num_token_out_local;
   }
+
+  
 
   return num_token_out;
 }

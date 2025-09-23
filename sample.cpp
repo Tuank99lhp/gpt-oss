@@ -39,6 +39,9 @@ static void softmax_gpu(float *x, int n) {
 
 // GPU argmax
 static int sample_argmax_gpu(const float *p, int n) {
+    int device_id = 0;
+    HIP_CHECK(hipGetDevice(&device_id));
+    float *h_p = batch_states[device_id].h_p;
     HIP_CHECK(hipMemcpy(h_p, p, n * sizeof(float), hipMemcpyDeviceToHost));
     int m = 0;
     float mv = h_p[0];
@@ -51,6 +54,9 @@ static int sample_argmax_gpu(const float *p, int n) {
 
 // GPU multinomial sampling
 static int sample_mult_gpu(float *p, int n, float coin) {
+    int device_id = 0;
+    HIP_CHECK(hipGetDevice(&device_id));
+    float *h_p = batch_states[device_id].h_p;
     HIP_CHECK(hipMemcpy(h_p, p, n * sizeof(float), hipMemcpyDeviceToHost));
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -65,6 +71,9 @@ static int sample_mult_gpu(float *p, int n, float coin) {
 }
 
 static int sample_topp_gpu(float *p, int n, float topp, ProbIndex *probindex, float coin) {
+    int device_id = 0;
+    HIP_CHECK(hipGetDevice(&device_id));
+    float *h_p = batch_states[device_id].h_p;
     HIP_CHECK(hipMemcpy(h_p, p, n * sizeof(float), hipMemcpyDeviceToHost));
     int n0 = 0;
     const float cutoff = (1.0f - topp) / (n - 1);

@@ -12,9 +12,12 @@
 #include "batch_hip/embedding_batch.cpp"
 
 void forward_batch(Transformer *transformer, int batch_size) {
+  int device_id = 0;
+  HIP_CHECK(hipGetDevice(&device_id));
+  
+  BatchState *g_batch_state = &batch_states[device_id];
   Config *p = &transformer->config;
-  TransformerWeights *w = &transformer->weights;
-  RunState *s = &transformer->state;
+  TransformerWeights *w = &transformer_weights[device_id];
   
   int hidden_dim = p->hidden_dim;
   int head_dim = p->head_dim;
@@ -22,6 +25,19 @@ void forward_batch(Transformer *transformer, int batch_size) {
   int kv_mul = p->n_attn_heads / p->n_kv_heads;
   int n_qkv_heads = p->n_attn_heads + 2 * p->n_kv_heads;
   const int row_stride = p->seq_len + 1;
+
+  int *h_topk_i = g_batch_state->h_topk_i;
+  float *h_topk_v = g_batch_state->h_topk_v;
+
+  int *d_current_tokens = g_batch_state->d_current_tokens;
+  int *d_positions = g_batch_state->d_positions;
+  float *cosB = g_batch_state->cosB;
+  float *sinB = g_batch_state->sinB;
+  
+  hip_bfloat16 *d_w_mlp1_bf16 = g_batch_state->d_w_mlp1_bf16;
+  hip_bfloat16 *d_w_mlp2_bf16 = g_batch_state->d_w_mlp2_bf16;
+
+  BatchStateMOE* MOE_tmp_batch_state = g_batch_state->MOE_tmp_batch_state;
 
   HIP_CHECK(hipMemcpyAsync(d_current_tokens, g_batch_state->current_tokens, 
                           batch_size * sizeof(int), hipMemcpyHostToDevice, 0));

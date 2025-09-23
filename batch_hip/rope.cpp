@@ -109,18 +109,26 @@ __global__ void k_rope_k_batch(float* __restrict__ k_all, // [L, MAX_BATCH, seq_
   }
 }
 
-// ======= Bộ nhớ cache inv_freq (tạo 1 lần, dùng lại) =======
-static float *g_inv_freq_dev = nullptr; // [half] on device
-float        *d_conc = nullptr;
-static int    g_cached_hd    = 0;
-static float  g_cached_base  = 0.f, g_cached_scale = 0.f, g_cached_ic = 0.f, g_cached_b = 0.f, g_cached_a = 0.f;
-static float  g_concentration = 1.f;
-
 static inline void rope_ensure_invfreq(int head_dim, float base,
                                        float scaling_factor, float initial_context_length,
                                        float ntk_beta, float ntk_alpha,
                                        hipStream_t stream = 0)
 {
+  int device_id = 0;
+  HIP_CHECK(hipGetDevice(&device_id));
+  BatchState *g_batch_state = &batch_states[device_id];
+
+  float *g_inv_freq_dev = g_batch_state->g_inv_freq_dev;
+  float *d_conc = g_batch_state->d_conc;
+
+  int    &g_cached_hd    = g_batch_state->g_cached_hd;
+  float  &g_cached_base  = g_batch_state->g_cached_base;
+  float  &g_cached_scale = g_batch_state->g_cached_scale;
+  float  &g_cached_ic    = g_batch_state->g_cached_ic;
+  float  &g_cached_b     = g_batch_state->g_cached_b;
+  float  &g_cached_a     = g_batch_state->g_cached_a;
+  float  &g_concentration = g_batch_state->g_concentration;
+
   const bool need_rebuild =
       (g_inv_freq_dev == nullptr) ||
       (g_cached_hd   != head_dim) ||
@@ -159,6 +167,13 @@ static inline void rope_build_cos_sin_batch(float* cosB, float* sinB,
                                             int head_dim, int B,
                                             hipStream_t stream = 0)
 {
+  int device_id = 0;
+  HIP_CHECK(hipGetDevice(&device_id));
+  BatchState *g_batch_state = &batch_states[device_id];
+  
+  float *g_inv_freq_dev = g_batch_state->g_inv_freq_dev;
+  float g_concentration = g_batch_state->g_concentration;
+  
   const int half = head_dim >> 1;
   const int BS = 256;
   dim3 block(BS);
