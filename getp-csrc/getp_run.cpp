@@ -636,7 +636,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
             g_batch_state->positions[i] = 0;
             g_batch_state->current_tokens[i] = g_batch_state->prompt_tokens[i][0];
             g_batch_state->finished[i] = false;
-            g_batch_state->req_ids[i] = req_it;
+            g_batch_state->req_ids[i] = start_req + req_it;
 
             req_it++;
             active_count++;
