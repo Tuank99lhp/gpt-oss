@@ -11,7 +11,34 @@
 #include "batch_hip/split_gate_up.cpp"
 #include "batch_hip/embedding_batch.cpp"
 
+static bool first_print = true;
+
 void forward_batch(Transformer *transformer, int batch_size) {
+
+   // ---------------- Profiling accumulators ----------------
+  float t_embedding = 0, t_rmsnorm = 0, t_gemm_qkv = 0, t_bias_qkv = 0, t_split_qkv = 0;
+  float t_rope = 0, t_attn_scores = 0, t_softmax_attn = 0, t_attn_weighted_sum = 0;
+  float t_gemm_o = 0, t_bias_o = 0, t_axpy_tb2 = 0;
+  float t_rmsnorm_ffn = 0, t_gemm_router = 0, t_bias_router = 0, t_topk = 0, t_softmax_moe = 0, t_topk_cpy = 0;
+  float t_set_vec = 0,t_moe_gemm_mlp1 = 0, t_moe_bias_mlp1 = 0, t_moe_split_gate_up = 0, t_moe_swiglu = 0;
+  float t_moe_gemm_mlp2 = 0, t_moe_bias_mlp2 = 0, t_wexps_cpy = 0, t_moe_axpy = 0, t_moe_axpy_agg = 0;
+  float t_rmsnorm_out = 0, t_gemm_logits = 0;
+
+  hipEvent_t ev_start, ev_stop;
+  #define TIME_BLOCK(fn_call, t_accum) { \
+    if (first_print) { \
+      hipEventCreate(&ev_start); hipEventCreate(&ev_stop); \
+      hipEventRecord(ev_start, 0); \
+    } \
+      fn_call; \
+    if (first_print) { \
+      hipEventRecord(ev_stop, 0); hipEventSynchronize(ev_stop); \
+      float ms; hipEventElapsedTime(&ms, ev_start, ev_stop); \
+      t_accum += ms; \
+      hipEventDestroy(ev_start); hipEventDestroy(ev_stop); \
+    } \
+  }
+
   int device_id = 0;
   HIP_CHECK(hipGetDevice(&device_id));
   
@@ -39,6 +66,8 @@ void forward_batch(Transformer *transformer, int batch_size) {
 
   BatchStateMOE* MOE_tmp_batch_state = g_batch_state->MOE_tmp_batch_state;
 
+TIME_BLOCK({
+
   HIP_CHECK(hipMemcpyAsync(d_current_tokens, g_batch_state->current_tokens, 
                           batch_size * sizeof(int), hipMemcpyHostToDevice, 0));
                           
@@ -60,7 +89,12 @@ void forward_batch(Transformer *transformer, int batch_size) {
                       ntk_beta, ntk_alpha, 0
                     );
 
+}, t_embedding);
+
   for (int l = 0; l < p->n_layers; ++l) {
+    
+TIME_BLOCK({
+
     rmsnorm_batch_gpu(
       g_batch_state->batch_t,
       g_batch_state->batch_x, 
@@ -68,6 +102,10 @@ void forward_batch(Transformer *transformer, int batch_size) {
       batch_size, 
       hidden_dim
     );
+
+}, t_rmsnorm);
+
+TIME_BLOCK({
 
     gemm_gpu_batch_f32W(
       g_batch_state->batch_qkv, 
@@ -78,12 +116,20 @@ void forward_batch(Transformer *transformer, int batch_size) {
       batch_size
     );
 
+}, t_gemm_qkv);
+
+TIME_BLOCK({
+
     add_bias_gpu_batch_broadcast(
       g_batch_state->batch_qkv,
       w->b_qkv + 1ll * l * head_dim * n_qkv_heads,
       batch_size,
       head_dim * n_qkv_heads
     );
+
+}, t_bias_qkv);
+
+TIME_BLOCK({
 
     split_qkv_gpu_batch_devicepos(
       g_batch_state->batch_qkv,
@@ -99,6 +145,10 @@ void forward_batch(Transformer *transformer, int batch_size) {
       l,
       MAX_BATCH_SIZE
     );
+
+}, t_split_qkv);
+
+TIME_BLOCK({
 
     rope_build_cos_sin_batch(
       cosB, sinB, 
@@ -127,7 +177,11 @@ void forward_batch(Transformer *transformer, int batch_size) {
       0
     );
 
+}, t_rope);
+
     const bool use_sw = (p->sliding_window > 0) && ((l % 2) == 0);
+
+TIME_BLOCK({
 
     attn_scores_gpu_batch(
       g_batch_state->batch_q,
@@ -138,11 +192,19 @@ void forward_batch(Transformer *transformer, int batch_size) {
       head_dim, kv_mul, p->seq_len, kv_dim, p->n_attn_heads, batch_size,
       use_sw ? p->sliding_window : 0, 0);
 
+}, t_attn_scores);
+
+TIME_BLOCK({
+
     const float* sink_ptr = w->attn_sinks + 1ll * l * p->n_attn_heads;
     softmax_rows_with_sink_gpu_batch(
       g_batch_state->batch_att, sink_ptr, d_positions,
       p->n_attn_heads, batch_size, row_stride, 0
     );
+
+}, t_softmax_attn);
+
+TIME_BLOCK({
 
     attn_weighted_sum_gpu_batch(
       g_batch_state->batch_att,
@@ -150,9 +212,13 @@ void forward_batch(Transformer *transformer, int batch_size) {
       g_batch_state->batch_tb,
       d_positions, head_dim, kv_mul, p->seq_len, kv_dim, p->n_attn_heads, batch_size, 0
     );
+
+}, t_attn_weighted_sum);
     
     const float *Wo = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
     const float *Bo = w->b_o + 1ll * l * hidden_dim;
+
+TIME_BLOCK({
 
     gemm_gpu_batch_f32W(
       g_batch_state->batch_tb2,
@@ -163,12 +229,20 @@ void forward_batch(Transformer *transformer, int batch_size) {
       batch_size
     );
 
+}, t_gemm_o);
+
+TIME_BLOCK({
+
     add_bias_gpu_batch_broadcast(
       g_batch_state->batch_tb2,
       Bo,
       batch_size,
       hidden_dim
     );
+
+}, t_bias_o);
+
+TIME_BLOCK({
 
     axpy_gpu_batch(
       g_batch_state->batch_x,
@@ -177,8 +251,12 @@ void forward_batch(Transformer *transformer, int batch_size) {
       hidden_dim,
       batch_size
     );
+
+}, t_axpy_tb2);
     
     {
+
+TIME_BLOCK({
 
       rmsnorm_batch_gpu(
         g_batch_state->batch_t,
@@ -186,6 +264,10 @@ void forward_batch(Transformer *transformer, int batch_size) {
         w->rms_ffn_w + l * hidden_dim,
         batch_size, hidden_dim
       );
+
+}, t_rmsnorm_ffn);
+
+TIME_BLOCK({
 
       gemm_gpu_batch_f32W(
         g_batch_state->batch_router_score,
@@ -196,12 +278,20 @@ void forward_batch(Transformer *transformer, int batch_size) {
         batch_size
       );
 
+}, t_gemm_router);
+
+TIME_BLOCK({
+
       add_bias_gpu_batch_broadcast(
         g_batch_state->batch_router_score,
         w->b_router + l * p->n_experts,
         batch_size,
         p->n_experts
       );
+
+}, t_bias_router);
+
+TIME_BLOCK({
 
       topk_gpu_batch(
         g_batch_state->batch_topk_v,
@@ -213,6 +303,10 @@ void forward_batch(Transformer *transformer, int batch_size) {
         0
       );
 
+}, t_topk);
+
+TIME_BLOCK({
+
       softmax_rows_gpu_batch_constlen(
         g_batch_state->batch_topk_v,
         batch_size,
@@ -220,13 +314,19 @@ void forward_batch(Transformer *transformer, int batch_size) {
         p->experts_per_token,
         0
       );
+
+}, t_softmax_moe);
       
       const int H = hidden_dim;
       const int I = p->intermediate_dim;
       const int K = p->experts_per_token;
 
+TIME_BLOCK({
+
       HIP_CHECK(hipMemcpy(h_topk_i, g_batch_state->batch_topk_i, batch_size * K * sizeof(int), hipMemcpyDeviceToHost)); 
       HIP_CHECK(hipMemcpy(h_topk_v, g_batch_state->batch_topk_v, batch_size * K * sizeof(float), hipMemcpyDeviceToHost));
+
+}, t_topk_cpy);
 
       const long long mlp1_per = 2ll * I * H;
       const long long mlp2_per = 1ll * H * I;
@@ -239,11 +339,19 @@ void forward_batch(Transformer *transformer, int batch_size) {
         B = 0;
 
         for (int b = 0; b < batch_size; ++b) {
+          ds.idx_in_batch[b] = -1;
           for (int k = 0; k < K; ++k) {
             if (h_topk_i[b * K + k] == e) {
               ds.host_wexps[B] = h_topk_v[b * K + k];
-              set_vec(ds.batch_t + 1ll * B * H, g_batch_state->batch_t + 1ll * b * H, H);
-              ds.idx_in_batch[B] = b;
+
+TIME_BLOCK({
+
+              // set_vec(ds.batch_t + 1ll * B * H, g_batch_state->batch_t + 1ll * b * H, H);
+              ds.batch_t_gap[B] = g_batch_state->batch_t + 1ll * b * H;
+
+}, t_set_vec);
+
+              ds.idx_in_batch[b] = B;
               ++B;
               break;
             }
@@ -256,37 +364,91 @@ void forward_batch(Transformer *transformer, int batch_size) {
           const hip_bfloat16 *W1_local = d_w_mlp1_bf16 + offset_l * mlp1_per; 
           const float *B1_local = w->b_mlp1 + offset_l * (2 * I);
 
-          gemm_gpu_batch_bf16(ds.batch_mlp1_out, ds.batch_t, W1_local, H, 2 * I, B);
+TIME_BLOCK({
+
+          gemm_gpu_batch_bf16_2(ds.batch_mlp1_out, ds.batch_t_gap, W1_local, H, 2 * I, B);
+
+}, t_moe_gemm_mlp1);
+
+TIME_BLOCK({
+
           add_bias_gpu_batch_broadcast(ds.batch_mlp1_out, B1_local, B, 2 * I);
+
+}, t_moe_bias_mlp1);
+
+TIME_BLOCK({
 
           split_gate_up(ds.batch_mlp1_out, ds.batch_gate, ds.batch_up, I * B);
 
+}, t_moe_split_gate_up);
+
+TIME_BLOCK({
+
           swiglu_gpu_batch(ds.batch_gate, ds.batch_up, ds.batch_gate_up, I, 1.702f, p->swiglu_limit, B);
+
+}, t_moe_swiglu);
 
           const hip_bfloat16 *W2_local = d_w_mlp2_bf16 + offset_l * mlp2_per;
           const float *B2_local = w->b_mlp2 + offset_l * H;
 
+TIME_BLOCK({
+
           gemm_gpu_batch_bf16(ds.batch_t, ds.batch_gate_up, W2_local, I, H, B);
+          
+}, t_moe_gemm_mlp2);
+
+TIME_BLOCK({
+
           add_bias_gpu_batch_broadcast(ds.batch_t, B2_local, B, H);
 
+}, t_moe_bias_mlp2);
+
+TIME_BLOCK({
+
           HIP_CHECK(hipMemcpy(ds.batch_wexps, ds.host_wexps, B * sizeof(float), hipMemcpyHostToDevice));
+  
+}, t_wexps_cpy);
+
+TIME_BLOCK({
+
           xpy_gpu_batch_alpha_vec(ds.batch_t, ds.batch_t, ds.batch_wexps, H, B);
+  
+}, t_moe_axpy);
+
         }
       }
 
-      for (int e = 0; e < p->n_experts; ++e) {
-        BatchStateMOE &ds = MOE_tmp_batch_state[e];
-        int B = ds.num_batch;
-        #pragma omp parallel for
-        for (int b = 0; b < B; b++) {
-          int ob = ds.idx_in_batch[b];
-          axpy_gpu_batch(g_batch_state->batch_x + 1ll * ob * H,
-                   ds.batch_t + 1ll * b * H,
-                   1.0f, H, 1);
+      #pragma omp parallel for
+      for (int i = 0; i < batch_size; i++) {
+        float *dst = g_batch_state->batch_x + 1ll * i * H;
+        for (int k = 0; k < K; ++k) {
+          // for (int h = k + 1; h < K; ++h) {
+          //   if (h_topk_i[b * K + k] > h_topk_i[b * K + h]) {
+          //     int tmp = h_topk_i[b * K + k];
+          //     h_topk_i[b * K + k] = h_topk_i[b * K + h];
+          //     h_topk_i[b * K + h] = tmp;
+          //     float ftmp = h_topk_v[b * K + k];
+          //     h_topk_v[b * K + k] = h_topk_v[b * K + h];
+          //     h_topk_v[b * K + h] = ftmp;
+          //   }
+          // }
+          int e = h_topk_i[i * K + k];
+          BatchStateMOE &ds = MOE_tmp_batch_state[e];
+          int b = ds.idx_in_batch[i];
+          // assert(b >= 0 && b < ds.num_batch);
+
+TIME_BLOCK({
+
+          axpy_gpu_batch(dst, ds.batch_t + 1ll * b * H, 1.0f, H, 1);
+
+}, t_moe_axpy_agg);
+
         }
       }
     }
   }
+
+TIME_BLOCK({
 
   rmsnorm_batch_gpu(
     g_batch_state->batch_x,
@@ -295,6 +457,10 @@ void forward_batch(Transformer *transformer, int batch_size) {
     batch_size,
     hidden_dim
   );
+
+}, t_rmsnorm_out);
+
+TIME_BLOCK({
 
   gemm_gpu_batch_f32W(
     g_batch_state->batch_logits,
@@ -305,5 +471,54 @@ void forward_batch(Transformer *transformer, int batch_size) {
     batch_size
   );
 
+}, t_gemm_logits);
+
+  if (!first_print) {
+    return;
+  }
+  first_print = false;
+
+  printf("===== Profiling (1 GPU, batched) =====\n");
+  printf("[PROFILE] Embedding: %.3f ms\n", t_embedding);
+  printf("[PROFILE] RMSNorm1: %.3f ms\n", t_rmsnorm);
+  printf("[PROFILE] Gemm QKV: %.3f ms\n", t_gemm_qkv);
+  printf("[PROFILE] Bias QKV: %.3f ms\n", t_bias_qkv);
+  printf("[PROFILE] Split QKV: %.3f ms\n", t_split_qkv);
+  printf("[PROFILE] RoPE: %.3f ms\n", t_rope);
+  printf("[PROFILE] Attn scores: %.3f ms\n", t_attn_scores);
+  printf("[PROFILE] Softmax attn: %.3f ms\n", t_softmax_attn);
+  printf("[PROFILE] Attn weighted sum: %.3f ms\n", t_attn_weighted_sum);
+  printf("[PROFILE] Gemm O: %.3f ms\n", t_gemm_o);
+  printf("[PROFILE] Bias O: %.3f ms\n", t_bias_o);
+  printf("[PROFILE] AXPY TB2: %.3f ms\n", t_axpy_tb2);
+  printf("[PROFILE] RMSNorm2: %.3f ms\n", t_rmsnorm_ffn);
+  printf("[PROFILE] Gemm router: %.3f ms\n", t_gemm_router);
+  printf("[PROFILE] Bias router: %.3f ms\n", t_bias_router);
+  printf("[PROFILE] TopK: %.3f ms\n", t_topk);
+  printf("[PROFILE] Softmax MoE: %.3f ms\n", t_softmax_moe);
+  printf("[PROFILE] TopK cpy: %.3f ms\n", t_topk_cpy);
+  printf("[PROFILE] Set vec: %.3f ms\n", t_set_vec);
+  printf("[PROFILE] MoE Gemm MLP1: %.3f ms\n", t_moe_gemm_mlp1);
+  printf("[PROFILE] MoE Bias MLP1: %.3f ms\n", t_moe_bias_mlp1);
+  printf("[PROFILE] MoE Split gate up: %.3f ms\n", t_moe_split_gate_up);
+  printf("[PROFILE] MoE SwiGLU: %.3f ms\n", t_moe_swiglu);
+  printf("[PROFILE] MoE Gemm MLP2: %.3f ms\n", t_moe_gemm_mlp2);
+  printf("[PROFILE] MoE Bias MLP2: %.3f ms\n", t_moe_bias_mlp2);
+  printf("[PROFILE] MoE Wexps cpy: %.3f ms\n", t_wexps_cpy);
+  printf("[PROFILE] MoE AXPY: %.3f ms\n", t_moe_axpy);
+  printf("[PROFILE] MoE Agg: %.3f ms\n", t_moe_axpy_agg);
+  printf("[PROFILE] RMSNorm out: %.3f ms\n", t_rmsnorm_out);
+  printf("[PROFILE] Gemm logits: %.3f ms\n", t_gemm_logits);
+
+  float total = t_embedding + t_rmsnorm + t_gemm_qkv + t_bias_qkv + t_split_qkv +
+                t_rope + t_attn_scores + t_softmax_attn + t_attn_weighted_sum +
+                t_gemm_o + t_bias_o + t_axpy_tb2 +
+                t_rmsnorm_ffn + t_gemm_router + t_bias_router + t_topk + t_softmax_moe + t_topk_cpy +
+                t_set_vec + t_moe_gemm_mlp1 + t_moe_bias_mlp1 + t_moe_split_gate_up + t_moe_swiglu +
+                t_moe_gemm_mlp2 + t_moe_bias_mlp2 + t_wexps_cpy + t_moe_axpy + t_moe_axpy_agg +
+                t_rmsnorm_out + t_gemm_logits;
+  printf("[PROFILE] Total: %.3f ms\n", total);
+  printf("=======================================\n");
+  fflush(stdout);
   // HIP_CHECK(hipDeviceSynchronize());
 }

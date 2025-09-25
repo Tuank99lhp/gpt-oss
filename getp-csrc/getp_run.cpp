@@ -11,6 +11,7 @@
 typedef struct {
 
     float* batch_t;              // [max_batch_size, hidden_dim]
+    float** batch_t_gap;
 
     float* batch_mlp1_out;       // [max_batch_size, 2 * intermediate_dim]
     float* batch_gate;           // [max_batch_size, intermediate_dim]
@@ -90,8 +91,8 @@ typedef struct {
 
 } BatchState;
 
-int NUM_GPUS = 8;
-const int MAX_BATCH_SIZE = 64;
+int NUM_GPUS = 4;
+const int MAX_BATCH_SIZE = 128;
 BatchState* batch_states = NULL;
 TransformerWeights* transformer_weights = NULL;
 
@@ -182,8 +183,8 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
 
   // to_device(&w->out, ptr, 1ll*cfg->vocab_size*cfg->hidden_dim*sizeof(float));
   to_device_and_transpose(&w->out, ptr, 1, cfg->vocab_size, cfg->hidden_dim);
-
   ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
+
   to_device(&w->rms_attn_w, ptr, 1ll * n_layers * cfg->hidden_dim * sizeof(float));
   ptr += 1ll * n_layers * cfg->hidden_dim;
   to_device(&w->rms_ffn_w, ptr, 1ll * n_layers * cfg->hidden_dim * sizeof(float));
@@ -198,9 +199,9 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
   to_device_and_transpose(&w->w_qkv, ptr, n_layers,
                           head_dim * (cfg->n_attn_heads + 2 * cfg->n_kv_heads), 
                           cfg->hidden_dim);
-  
   ptr += 1ll * n_layers * cfg->hidden_dim *
          (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+
   to_device(&w->b_qkv, ptr,
             1ll * n_layers * (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads) *
             sizeof(float));
@@ -213,8 +214,8 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
   to_device_and_transpose(&w->w_o, ptr, n_layers,
                           cfg->hidden_dim,
                           head_dim * cfg->n_attn_heads);
-
   ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
+
   to_device(&w->b_o, ptr, 1ll * n_layers * cfg->hidden_dim * sizeof(float));
   ptr += 1ll * n_layers * cfg->hidden_dim;
   to_device(&w->attn_sinks, ptr, 1ll * n_layers * cfg->n_attn_heads * sizeof(float));
@@ -222,8 +223,8 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
 
   // to_device(&w->w_router, ptr, 1ll * n_layers * cfg->hidden_dim * n_experts * sizeof(float));
   to_device_and_transpose(&w->w_router, ptr, n_layers, n_experts, cfg->hidden_dim);
-
   ptr += 1ll * n_layers * cfg->hidden_dim * n_experts;
+  
   to_device(&w->b_router, ptr, 1ll * n_layers * n_experts * sizeof(float));
   ptr += 1ll * n_layers * n_experts;
     
@@ -440,6 +441,7 @@ static void alloc_batchstate_moe_on_device(BatchStateMOE &bs, const Config &c) {
   const int B   = MAX_BATCH_SIZE;
 
   alloc_device(&bs.batch_t,   1ll * B * H * sizeof(float), 0.f, true);
+  HIP_CHECK(hipMalloc(&bs.batch_t_gap, B * sizeof(float*)));
 
   alloc_device(&bs.batch_mlp1_out,  1ll * B * (2 * I) * sizeof(float), 0.f, true);
 
@@ -456,6 +458,10 @@ static void alloc_batchstate_moe_on_device(BatchStateMOE &bs, const Config &c) {
 
 static void free_batchstate_moe_on_device(BatchStateMOE &bs) {
   free_float_device(bs.batch_t);
+  if (bs.batch_t_gap) {
+    hipFree(bs.batch_t_gap);
+    bs.batch_t_gap = nullptr;
+  }
 
   free_float_device(bs.batch_mlp1_out);
 
@@ -487,6 +493,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - ...
   
   Config &c = transformer->config;
+  c.seq_len /= 2;
   
   batch_states = (BatchState*)malloc(NUM_GPUS * sizeof(BatchState));
   transformer_weights = (TransformerWeights*)malloc(NUM_GPUS * sizeof(TransformerWeights));
