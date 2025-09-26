@@ -9,24 +9,6 @@
 #define GETP_RUN
 
 typedef struct {
-
-    float* batch_t;              // [max_batch_size, hidden_dim]
-    float** batch_t_gap;
-
-    float* batch_mlp1_out;       // [max_batch_size, 2 * intermediate_dim]
-    float* batch_gate;           // [max_batch_size, intermediate_dim]
-    float* batch_up;             // [max_batch_size, intermediate_dim]
-    float* batch_gate_up;        // [max_batch_size, intermediate_dim]
-
-    float* batch_wexps;
-    float* host_wexps;
-
-    int* idx_in_batch;
-    int num_batch;
-
-} BatchStateMOE;
-
-typedef struct {
     // ==== Per-request state (host) ====
     int* positions;              // [batch_size]  vị trí hiện tại của từng sequence
     int* num_prompt_tokens;      // [batch_size]  độ dài prompt của từng sequence
@@ -67,9 +49,6 @@ typedef struct {
 
     float* mask;
 
-    int* h_topk_i;
-    float* h_topk_v;
-
     int* d_current_tokens;
     int* d_positions;
     float* cosB;
@@ -87,7 +66,17 @@ typedef struct {
     float  g_cached_base  = 0.f, g_cached_scale = 0.f, g_cached_ic = 0.f, g_cached_b = 0.f, g_cached_a = 0.f;
     float  g_concentration = 1.f;
 
-    BatchStateMOE* MOE_tmp_batch_state;
+    int*    h_counts;
+    int*    d_counts;
+    int*    d_idx_in_batch;
+    float*  d_wexps;
+    float** d_in_ptrs;
+    float*  d_out;
+    
+    float* batch_mlp1_out;       // [max_batch_size, 2 * intermediate_dim]
+    float* batch_gate;           // [max_batch_size, intermediate_dim]
+    float* batch_up;             // [max_batch_size, intermediate_dim]
+    float* batch_gate_up;        // [max_batch_size, intermediate_dim]
 
 } BatchState;
 
@@ -369,6 +358,28 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
   } else {
     bs.mask = nullptr;
   }
+
+  int E = c.n_experts;
+  int I = c.intermediate_dim;
+
+  bs.h_counts = (int*)malloc(E * sizeof(int));
+
+  HIP_CHECK(hipMalloc((void**)&bs.d_counts, E * sizeof(int)));
+  HIP_CHECK(hipMemset(bs.d_counts, 0, E * sizeof(int)));
+
+  HIP_CHECK(hipMalloc((void**)&bs.d_idx_in_batch, E * B * sizeof(int)));
+  HIP_CHECK(hipMemset(bs.d_idx_in_batch, 0, E * B * sizeof(int)));
+  
+  HIP_CHECK(hipMalloc((void**)&bs.d_in_ptrs, E * B * sizeof(float*)));
+  HIP_CHECK(hipMemset(bs.d_in_ptrs, 0, E * B * sizeof(float*)));
+
+  alloc_device(&bs.d_wexps, E * B * sizeof(float), 0.f, true);
+  
+  alloc_device(&bs.batch_mlp1_out, 1ll * B * (2 * I) * sizeof(float), 0.f, true);
+  alloc_device(&bs.batch_gate, 1ll * B * I * sizeof(float), 0.f, true);
+  alloc_device(&bs.batch_up, 1ll * B * I * sizeof(float), 0.f, true);
+  alloc_device(&bs.batch_gate_up, 1ll * B * I * sizeof(float), 0.f, true);
+  alloc_device(&bs.d_out, 1ll * E * B * H * sizeof(float), 0.f, true);
 }
 
 static void free_batchstate_on_device(BatchState &bs) {
@@ -387,6 +398,24 @@ static void free_batchstate_on_device(BatchState &bs) {
   free_float_device(bs.batch_topk_v);
   free_float_device(bs.batch_logits);
   free_float_device(bs.mask);
+  
+  free_int_device(bs.d_counts);
+  free_int_device(bs.d_idx_in_batch);
+  free_float_device(bs.d_wexps);
+  free_float_device(bs.d_out);
+  free_float_device(bs.batch_mlp1_out);
+  free_float_device(bs.batch_gate);
+  free_float_device(bs.batch_up);
+  free_float_device(bs.batch_gate_up);
+  if (bs.d_in_ptrs) {
+    HIP_CHECK(hipFree(bs.d_in_ptrs));
+    bs.d_in_ptrs = nullptr;
+  }
+
+  if (bs.h_counts) {
+    free(bs.h_counts);
+    bs.h_counts = nullptr;
+  }
 
   // Host frees
   if (bs.prompt_tokens) {
@@ -433,54 +462,6 @@ static void free_batchstate_on_device(BatchState &bs) {
 
 }
 
-// -------------------------- BatchStateMOE management --------------------------
-
-static void alloc_batchstate_moe_on_device(BatchStateMOE &bs, const Config &c) {
-  const int H   = c.hidden_dim;
-  const int I   = c.intermediate_dim;
-  const int B   = MAX_BATCH_SIZE;
-
-  alloc_device(&bs.batch_t,   1ll * B * H * sizeof(float), 0.f, true);
-  HIP_CHECK(hipMalloc(&bs.batch_t_gap, B * sizeof(float*)));
-
-  alloc_device(&bs.batch_mlp1_out,  1ll * B * (2 * I) * sizeof(float), 0.f, true);
-
-  alloc_device(&bs.batch_gate,      1ll * B * I * sizeof(float), 0.f, true);
-  alloc_device(&bs.batch_up,        1ll * B * I * sizeof(float), 0.f, true);
-  alloc_device(&bs.batch_gate_up,   1ll * B * I * sizeof(float), 0.f, true);
-
-  alloc_device(&bs.batch_wexps, B * sizeof(float), 0.f, true);
-
-  bs.host_wexps = (float*)malloc(B * sizeof(float));
-
-  bs.idx_in_batch = (int*)malloc(B * sizeof(int));
-}
-
-static void free_batchstate_moe_on_device(BatchStateMOE &bs) {
-  free_float_device(bs.batch_t);
-  if (bs.batch_t_gap) {
-    hipFree(bs.batch_t_gap);
-    bs.batch_t_gap = nullptr;
-  }
-
-  free_float_device(bs.batch_mlp1_out);
-
-  free_float_device(bs.batch_gate);
-  free_float_device(bs.batch_up);
-  free_float_device(bs.batch_gate_up);
-
-  free_float_device(bs.batch_wexps);
-
-  if (bs.host_wexps) {
-    free(bs.host_wexps);
-    bs.host_wexps = nullptr;
-  }
-
-  if (bs.idx_in_batch) {
-    free(bs.idx_in_batch);
-    bs.idx_in_batch = nullptr;
-  }
-}
 
 // -------------------------- Main entry points --------------------------
 
@@ -493,12 +474,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - ...
   
   Config &c = transformer->config;
-  c.seq_len /= 2;
+  c.seq_len = 1025;
   
   batch_states = (BatchState*)malloc(NUM_GPUS * sizeof(BatchState));
   transformer_weights = (TransformerWeights*)malloc(NUM_GPUS * sizeof(TransformerWeights));
 
-  #pragma omp parallel for num_threads(NUM_GPUS)
   for (int i = 0; i < NUM_GPUS; ++i) {
     HIP_CHECK(hipSetDevice(i));
     BatchState *g_batch_state = &batch_states[i];
@@ -507,9 +487,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     memory_map_weights_gpu(&transformer_weights[i], &c, weights_ptr, g_batch_state);
 
     alloc_batchstate_on_device(*g_batch_state, c);
-
-    g_batch_state->h_topk_i = (int*)  malloc(MAX_BATCH_SIZE * c.experts_per_token * sizeof(int));
-    g_batch_state->h_topk_v = (float*)malloc(MAX_BATCH_SIZE * c.experts_per_token * sizeof(float));
 
     HIP_CHECK(hipMalloc(&g_batch_state->d_current_tokens, MAX_BATCH_SIZE * sizeof(int)));
     HIP_CHECK(hipMalloc(&g_batch_state->d_positions, MAX_BATCH_SIZE * sizeof(int)));
@@ -522,11 +499,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
       
     HIP_CHECK(hipMalloc(&g_batch_state->g_inv_freq_dev, half * sizeof(float)));
     HIP_CHECK(hipMalloc(&g_batch_state->d_conc, sizeof(float)));
-
-    g_batch_state->MOE_tmp_batch_state = (BatchStateMOE*)malloc(c.n_experts * sizeof(BatchStateMOE));
-    for (int i = 0; i < c.n_experts; ++i) {
-      alloc_batchstate_moe_on_device(g_batch_state->MOE_tmp_batch_state[i], c);
-    }
   }
 }
 
@@ -537,7 +509,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
-  #pragma omp parallel for num_threads(NUM_GPUS)
+  #pragma omp parallel for
   for (int i = 0; i < NUM_GPUS; ++i) {
     HIP_CHECK(hipSetDevice(i));
     BatchState *g_batch_state = &batch_states[i];
@@ -545,15 +517,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     free_weights_gpu(transformer_weights[i], g_batch_state);
 
     free_batchstate_on_device(*g_batch_state);
-    
-    if (g_batch_state->h_topk_i) {
-      free(g_batch_state->h_topk_i);
-      g_batch_state->h_topk_i = nullptr;
-    }
-    if (g_batch_state->h_topk_v) {
-      free(g_batch_state->h_topk_v);
-      g_batch_state->h_topk_v = nullptr;
-    }
 
     HIP_CHECK(hipFree(g_batch_state->d_current_tokens));
     HIP_CHECK(hipFree(g_batch_state->d_positions));
@@ -564,12 +527,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 
     HIP_CHECK(hipFree(g_batch_state->g_inv_freq_dev));
     HIP_CHECK(hipFree(g_batch_state->d_conc));
-
-    for (int i = 0; i < transformer->config.n_experts; ++i) {
-      free_batchstate_moe_on_device(g_batch_state->MOE_tmp_batch_state[i]);
-    }
-    free(g_batch_state->MOE_tmp_batch_state); 
-    g_batch_state->MOE_tmp_batch_state = NULL;
   }
 
   free(transformer_weights);
@@ -585,7 +542,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   int div = requests->num_reqs / NUM_GPUS;
   int mod = requests->num_reqs % NUM_GPUS;
   
-  #pragma omp parallel for num_threads(NUM_GPUS)
+  #pragma omp parallel for
   for (int d = 0; d < NUM_GPUS; d++) {
     HIP_CHECK(hipSetDevice(d));
 

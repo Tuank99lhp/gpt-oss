@@ -1,5 +1,7 @@
 #include "batch_hip/rms_norm.cpp"
-#include "batch_hip/matmul.cpp"
+#include "batch_hip/matmul_bf16_X1D.cpp"
+#include "batch_hip/matmul_bf16_X2D.cpp"
+#include "batch_hip/matmul_fp32.cpp"
 #include "batch_hip/add_bias.cpp"
 #include "batch_hip/split_qkv.cpp"
 #include "batch_hip/axpy.cpp"
@@ -10,6 +12,7 @@
 #include "batch_hip/top_k.cpp"
 #include "batch_hip/split_gate_up.cpp"
 #include "batch_hip/embedding_batch.cpp"
+#include "batch_hip/moe.cpp"
 
 static bool first_print = true;
 
@@ -53,9 +56,6 @@ void forward_batch(Transformer *transformer, int batch_size) {
   int n_qkv_heads = p->n_attn_heads + 2 * p->n_kv_heads;
   const int row_stride = p->seq_len + 1;
 
-  int *h_topk_i = g_batch_state->h_topk_i;
-  float *h_topk_v = g_batch_state->h_topk_v;
-
   int *d_current_tokens = g_batch_state->d_current_tokens;
   int *d_positions = g_batch_state->d_positions;
   float *cosB = g_batch_state->cosB;
@@ -63,8 +63,6 @@ void forward_batch(Transformer *transformer, int batch_size) {
   
   hip_bfloat16 *d_w_mlp1_bf16 = g_batch_state->d_w_mlp1_bf16;
   hip_bfloat16 *d_w_mlp2_bf16 = g_batch_state->d_w_mlp2_bf16;
-
-  BatchStateMOE* MOE_tmp_batch_state = g_batch_state->MOE_tmp_batch_state;
 
 TIME_BLOCK({
 
@@ -254,198 +252,169 @@ TIME_BLOCK({
 
 }, t_axpy_tb2);
     
-    {
+// ------------------------- MoE -------------------------
 
 TIME_BLOCK({
 
-      rmsnorm_batch_gpu(
-        g_batch_state->batch_t,
-        g_batch_state->batch_x,
-        w->rms_ffn_w + l * hidden_dim,
-        batch_size, hidden_dim
-      );
+    rmsnorm_batch_gpu(
+      g_batch_state->batch_t,
+      g_batch_state->batch_x,
+      w->rms_ffn_w + l * hidden_dim,
+      batch_size, hidden_dim
+    );
 
 }, t_rmsnorm_ffn);
 
 TIME_BLOCK({
 
-      gemm_gpu_batch_f32W(
-        g_batch_state->batch_router_score,
-        g_batch_state->batch_t,
-        w->w_router + l * hidden_dim * p->n_experts,
-        hidden_dim,
-        p->n_experts,
-        batch_size
-      );
+    gemm_gpu_batch_f32W(
+      g_batch_state->batch_router_score,
+      g_batch_state->batch_t,
+      w->w_router + l * hidden_dim * p->n_experts,
+      hidden_dim,
+      p->n_experts,
+      batch_size
+    );
 
 }, t_gemm_router);
 
 TIME_BLOCK({
 
-      add_bias_gpu_batch_broadcast(
-        g_batch_state->batch_router_score,
-        w->b_router + l * p->n_experts,
-        batch_size,
-        p->n_experts
-      );
+    add_bias_gpu_batch_broadcast(
+      g_batch_state->batch_router_score,
+      w->b_router + l * p->n_experts,
+      batch_size,
+      p->n_experts
+    );
 
 }, t_bias_router);
 
 TIME_BLOCK({
 
-      topk_gpu_batch(
-        g_batch_state->batch_topk_v,
-        g_batch_state->batch_topk_i,
-        g_batch_state->batch_router_score,
-        batch_size,
-        p->n_experts,
-        p->experts_per_token,
-        0
-      );
+    topk_gpu_batch(
+      g_batch_state->batch_topk_v,
+      g_batch_state->batch_topk_i,
+      g_batch_state->batch_router_score,
+      batch_size,
+      p->n_experts,
+      p->experts_per_token,
+      0
+    );
 
 }, t_topk);
 
 TIME_BLOCK({
 
-      softmax_rows_gpu_batch_constlen(
-        g_batch_state->batch_topk_v,
-        batch_size,
-        p->experts_per_token,
-        p->experts_per_token,
-        0
-      );
+    softmax_rows_gpu_batch_constlen(
+      g_batch_state->batch_topk_v,
+      batch_size,
+      p->experts_per_token,
+      p->experts_per_token,
+      0
+    );
 
 }, t_softmax_moe);
-      
-      const int H = hidden_dim;
-      const int I = p->intermediate_dim;
-      const int K = p->experts_per_token;
+    
+    const int H = hidden_dim;
+    const int I = p->intermediate_dim;
+    const int K = p->experts_per_token;
+    const int E = p->n_experts;
 
 TIME_BLOCK({
 
-      HIP_CHECK(hipMemcpy(h_topk_i, g_batch_state->batch_topk_i, batch_size * K * sizeof(int), hipMemcpyDeviceToHost)); 
-      HIP_CHECK(hipMemcpy(h_topk_v, g_batch_state->batch_topk_v, batch_size * K * sizeof(float), hipMemcpyDeviceToHost));
+    set(g_batch_state->d_counts, 0, E);
 
-}, t_topk_cpy);
+    moe_assign_from_topk(
+      g_batch_state->batch_topk_i,
+      g_batch_state->batch_topk_v,
+      g_batch_state->batch_t,
+      H, batch_size, K, E,
+      g_batch_state->d_counts,
+      g_batch_state->d_idx_in_batch,
+      g_batch_state->d_in_ptrs,
+      g_batch_state->d_wexps
+    );
 
-      const long long mlp1_per = 2ll * I * H;
-      const long long mlp2_per = 1ll * H * I;
-
-      #pragma omp parallel for
-      for (int e = 0; e < p->n_experts; e++) {
-        BatchStateMOE &ds = MOE_tmp_batch_state[e];
-
-        int &B = ds.num_batch; 
-        B = 0;
-
-        for (int b = 0; b < batch_size; ++b) {
-          ds.idx_in_batch[b] = -1;
-          for (int k = 0; k < K; ++k) {
-            if (h_topk_i[b * K + k] == e) {
-              ds.host_wexps[B] = h_topk_v[b * K + k];
-
-TIME_BLOCK({
-
-              // set_vec(ds.batch_t + 1ll * B * H, g_batch_state->batch_t + 1ll * b * H, H);
-              ds.batch_t_gap[B] = g_batch_state->batch_t + 1ll * b * H;
+    
+    HIP_CHECK(hipMemcpy(g_batch_state->h_counts, g_batch_state->d_counts, E * sizeof(int), hipMemcpyDeviceToHost));
 
 }, t_set_vec);
+    
+    const long long mlp1_per = 2ll * I * H;
+    const long long mlp2_per = 1ll * H * I;
 
-              ds.idx_in_batch[b] = B;
-              ++B;
-              break;
-            }
-          }
-        }
+    // #pragma omp parallel for
+    for (int e = 0; e < E; e++) {
+      int B = g_batch_state->h_counts[e];
+      if (B > 0) {
 
-        if (B > 0) {
-          long long offset_l = 1ll * l * p->n_experts + e;
+        float **batch_t_gap = g_batch_state->d_in_ptrs + e * batch_size;
+        float *batch_mlp1_out = g_batch_state->batch_mlp1_out;
+        float *batch_gate = g_batch_state->batch_gate;
+        float *batch_up = g_batch_state->batch_up;
+        float *batch_gate_up = g_batch_state->batch_gate_up;
+        float *d_out = g_batch_state->d_out + 1ll * e * batch_size * H;
 
-          const hip_bfloat16 *W1_local = d_w_mlp1_bf16 + offset_l * mlp1_per; 
-          const float *B1_local = w->b_mlp1 + offset_l * (2 * I);
+        long long offset_l = 1ll * l * p->n_experts + e;
+
+        const hip_bfloat16 *W1_local = d_w_mlp1_bf16 + offset_l * mlp1_per; 
+        const float *B1_local = w->b_mlp1 + offset_l * (2 * I);
 
 TIME_BLOCK({
 
-          gemm_gpu_batch_bf16_2(ds.batch_mlp1_out, ds.batch_t_gap, W1_local, H, 2 * I, B);
+        gemm_gpu_batch_bf16_2(batch_mlp1_out, batch_t_gap, W1_local, H, 2 * I, B);
 
 }, t_moe_gemm_mlp1);
 
 TIME_BLOCK({
 
-          add_bias_gpu_batch_broadcast(ds.batch_mlp1_out, B1_local, B, 2 * I);
+        add_bias_gpu_batch_broadcast(batch_mlp1_out, B1_local, B, 2 * I);
 
 }, t_moe_bias_mlp1);
 
 TIME_BLOCK({
 
-          split_gate_up(ds.batch_mlp1_out, ds.batch_gate, ds.batch_up, I * B);
+        split_gate_up(batch_mlp1_out, batch_gate, batch_up, I * B);
 
 }, t_moe_split_gate_up);
 
 TIME_BLOCK({
 
-          swiglu_gpu_batch(ds.batch_gate, ds.batch_up, ds.batch_gate_up, I, 1.702f, p->swiglu_limit, B);
+        swiglu_gpu_batch(batch_gate, batch_up, batch_gate_up, I, 1.702f, p->swiglu_limit, B);
 
 }, t_moe_swiglu);
 
-          const hip_bfloat16 *W2_local = d_w_mlp2_bf16 + offset_l * mlp2_per;
-          const float *B2_local = w->b_mlp2 + offset_l * H;
+        const hip_bfloat16 *W2_local = d_w_mlp2_bf16 + offset_l * mlp2_per;
+        const float *B2_local = w->b_mlp2 + offset_l * H;
 
 TIME_BLOCK({
 
-          gemm_gpu_batch_bf16(ds.batch_t, ds.batch_gate_up, W2_local, I, H, B);
-          
+        gemm_gpu_batch_bf16(d_out, batch_gate_up, W2_local, I, H, B);
+
 }, t_moe_gemm_mlp2);
 
 TIME_BLOCK({
 
-          add_bias_gpu_batch_broadcast(ds.batch_t, B2_local, B, H);
+        add_bias_gpu_batch_broadcast(d_out, B2_local, B, H);
 
 }, t_moe_bias_mlp2);
 
-TIME_BLOCK({
-
-          HIP_CHECK(hipMemcpy(ds.batch_wexps, ds.host_wexps, B * sizeof(float), hipMemcpyHostToDevice));
-  
-}, t_wexps_cpy);
-
-TIME_BLOCK({
-
-          xpy_gpu_batch_alpha_vec(ds.batch_t, ds.batch_t, ds.batch_wexps, H, B);
-  
-}, t_moe_axpy);
-
-        }
-      }
-
-      #pragma omp parallel for
-      for (int i = 0; i < batch_size; i++) {
-        float *dst = g_batch_state->batch_x + 1ll * i * H;
-        for (int k = 0; k < K; ++k) {
-          // for (int h = k + 1; h < K; ++h) {
-          //   if (h_topk_i[b * K + k] > h_topk_i[b * K + h]) {
-          //     int tmp = h_topk_i[b * K + k];
-          //     h_topk_i[b * K + k] = h_topk_i[b * K + h];
-          //     h_topk_i[b * K + h] = tmp;
-          //     float ftmp = h_topk_v[b * K + k];
-          //     h_topk_v[b * K + k] = h_topk_v[b * K + h];
-          //     h_topk_v[b * K + h] = ftmp;
-          //   }
-          // }
-          int e = h_topk_i[i * K + k];
-          BatchStateMOE &ds = MOE_tmp_batch_state[e];
-          int b = ds.idx_in_batch[i];
-          // assert(b >= 0 && b < ds.num_batch);
-
-TIME_BLOCK({
-
-          axpy_gpu_batch(dst, ds.batch_t + 1ll * b * H, 1.0f, H, 1);
-
-}, t_moe_axpy_agg);
-
-        }
       }
     }
+
+TIME_BLOCK({
+
+    moe_aggregate_topk(
+      g_batch_state->batch_topk_i,
+      g_batch_state->batch_topk_v,
+      g_batch_state->d_idx_in_batch,
+      g_batch_state->d_out,
+      g_batch_state->batch_x,
+      H, batch_size, K, E
+    );
+
+}, t_moe_axpy_agg);
+  
   }
 
 TIME_BLOCK({
