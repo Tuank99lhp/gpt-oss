@@ -40,7 +40,6 @@ typedef struct {
     // Attention scores & outputs
     float* batch_att;            // [max_batch_size, n_attn_heads, (seq_len + 1)]  // +1 để append sink
     float* batch_tb;             // [max_batch_size, head_dim * n_attn_heads]
-    float* batch_tb2;            // [max_batch_size, hidden_dim]
 
     // ==== MLP / MoE buffers (device) ====
     float* batch_router_score;   // [max_batch_size, n_experts]
@@ -80,7 +79,7 @@ typedef struct {
 
 } BatchState;
 
-int NUM_GPUS = 4;
+int NUM_GPUS = 2;
 const int MAX_BATCH_SIZE = 128;
 BatchState* batch_states = NULL;
 TransformerWeights* transformer_weights = NULL;
@@ -330,7 +329,6 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
   // Attention scores & outputs
   alloc_device(&bs.batch_att, 1ll * B * Hq * (c.seq_len + 1) * sizeof(float), 0.f, true); // +1 cho sink
   alloc_device(&bs.batch_tb, 1ll * B * (D * Hq) * sizeof(float), 0.f, true);
-  alloc_device(&bs.batch_tb2, 1ll * B * H * sizeof(float), 0.f, true);
 
   // MLP / MoE
   alloc_device(&bs.batch_router_score, 1ll * B * c.n_experts * sizeof(float), 0.f, true);
@@ -392,7 +390,6 @@ static void free_batchstate_on_device(BatchState &bs) {
   free_float_device(bs.batch_v);
   free_float_device(bs.batch_att);
   free_float_device(bs.batch_tb);
-  free_float_device(bs.batch_tb2);
   free_float_device(bs.batch_router_score);
   free_int_device(bs.batch_topk_i);
   free_float_device(bs.batch_topk_v);

@@ -219,7 +219,7 @@ TIME_BLOCK({
 TIME_BLOCK({
 
     gemm_gpu_batch_f32W(
-      g_batch_state->batch_tb2,
+      g_batch_state->batch_t,
       g_batch_state->batch_tb,
       Wo,
       head_dim * p->n_attn_heads, 
@@ -232,7 +232,7 @@ TIME_BLOCK({
 TIME_BLOCK({
 
     add_bias_gpu_batch_broadcast(
-      g_batch_state->batch_tb2,
+      g_batch_state->batch_t,
       Bo,
       batch_size,
       hidden_dim
@@ -244,7 +244,7 @@ TIME_BLOCK({
 
     axpy_gpu_batch(
       g_batch_state->batch_x,
-      g_batch_state->batch_tb2,
+      g_batch_state->batch_t,
       1.0f,
       hidden_dim,
       batch_size
@@ -343,7 +343,7 @@ TIME_BLOCK({
     const long long mlp1_per = 2ll * I * H;
     const long long mlp2_per = 1ll * H * I;
 
-    // #pragma omp parallel for
+    #pragma omp parallel for
     for (int e = 0; e < E; e++) {
       int B = g_batch_state->h_counts[e];
       if (B > 0) {
