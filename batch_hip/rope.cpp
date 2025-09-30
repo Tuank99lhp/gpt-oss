@@ -207,3 +207,67 @@ static inline void rope_apply_k_batch(float* k_all, const float* cosB, const flo
                      k_all, cosB, sinB, d_positions,
                      B, n_kv, head_dim, seq_len, kv_dim, layer, MAX_BATCH_SIZE);
 }
+
+// k_all: [L, MAX_BATCH, seq_len, kv_dim] (bf16), cosB/sinB: [B, head_dim/2] (f32)
+__global__ void k_rope_k_batch_bf16(hip_bfloat16*   __restrict__ k_all,
+                                    const float*    __restrict__ cosB,
+                                    const float*    __restrict__ sinB,
+                                    const int*      __restrict__ positions,
+                                    int B, int n_kv, int head_dim,
+                                    int seq_len, int kv_dim,
+                                    int layer, int MAX_BATCH_SIZE) {
+  const int b = blockIdx.y;
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+
+  if (b >= B || h >= n_kv) {
+    return;
+  }
+
+  const int half = head_dim >> 1;
+
+  const size_t layer_stride = MAX_BATCH_SIZE * seq_len * kv_dim;
+
+  hip_bfloat16* k_layer = k_all + layer * layer_stride;
+
+  const int pos = positions[b];
+
+  const size_t row = (b * seq_len + pos) * kv_dim + h * head_dim;
+
+  for (int i = tid; i < half; i += blockDim.x) {
+    const float c = cosB[b * half + i];
+    const float s = sinB[b * half + i];
+
+    const float x1 = bf16_to_f32(k_layer[row + i]);
+    const float x2 = bf16_to_f32(k_layer[row + half + i]);
+
+    const float o1 = x1 * c - x2 * s;
+    const float o2 = x2 * c + x1 * s;
+
+    k_layer[row + i]         = f32_to_bf16(o1);
+    k_layer[row + half + i]  = f32_to_bf16(o2);
+  }
+}
+
+static inline void rope_apply_k_batch_bf16(hip_bfloat16* k_all,
+                                           const float*  cosB,
+                                           const float*  sinB,
+                                           const int*    d_positions,
+                                           int B,
+                                           int n_kv,
+                                           int head_dim,
+                                           int seq_len,
+                                           int kv_dim,
+                                           int layer,
+                                           int MAX_BATCH_SIZE,
+                                           hipStream_t stream = 0) {
+  const int BS = 256;
+  dim3 block(BS);
+  dim3 grid(n_kv, B, 1);
+
+  hipLaunchKernelGGL(
+    k_rope_k_batch_bf16, grid, block, 0, stream,
+    k_all, cosB, sinB, d_positions,
+    B, n_kv, head_dim, seq_len, kv_dim, layer, MAX_BATCH_SIZE
+  );
+}

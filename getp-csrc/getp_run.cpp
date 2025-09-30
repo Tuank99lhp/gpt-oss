@@ -26,7 +26,7 @@ typedef struct {
 
     // Emb/Residual stream
     float* batch_x;              // [max_batch_size, hidden_dim]
-    float* batch_t;              // [max_batch_size, hidden_dim]
+    hip_bfloat16* batch_t;              // [max_batch_size, hidden_dim]
 
     // Attention projections
     float* batch_qkv;            // [max_batch_size, head_dim * (n_attn_heads + 2*n_kv_heads)]
@@ -34,12 +34,13 @@ typedef struct {
 
     // Attention caches (cho toàn bộ lịch sử 0..pos, theo layer & batch)
     // Layout gợi ý: [n_layers, max_batch_size, seq_len, kv_dim]
-    float* batch_k;              // size = n_layers * max_batch_size * seq_len * (head_dim * n_kv_heads)
-    float* batch_v;              // như trên
+    hip_bfloat16* batch_k;
+    hip_bfloat16* batch_v;
 
     // Attention scores & outputs
     float* batch_att;            // [max_batch_size, n_attn_heads, (seq_len + 1)]  // +1 để append sink
-    float* batch_tb;             // [max_batch_size, head_dim * n_attn_heads]
+    hip_bfloat16* batch_tb;      // [max_batch_size, head_dim * n_attn_heads]
+    float* batch_tb2;            // [max_batch_size, hidden_dim]
 
     // ==== MLP / MoE buffers (device) ====
     float* batch_router_score;   // [max_batch_size, n_experts]
@@ -55,8 +56,12 @@ typedef struct {
 
     float* h_p;
 
+    hip_bfloat16* d_w_qkv_bf16;
+    hip_bfloat16* d_w_o_bf16;
+    hip_bfloat16* d_w_router_bf16;
     hip_bfloat16* d_w_mlp1_bf16;
     hip_bfloat16* d_w_mlp2_bf16;
+    hip_bfloat16* d_w_out_bf16;
     
     // ======= Bộ nhớ cache inv_freq (tạo 1 lần, dùng lại) =======
     float* g_inv_freq_dev; // [half] on device
@@ -69,18 +74,18 @@ typedef struct {
     int*    d_counts;
     int*    d_idx_in_batch;
     float*  d_wexps;
-    float** d_in_ptrs;
+    hip_bfloat16** d_in_ptrs;
     float*  d_out;
     
     float* batch_mlp1_out;       // [max_batch_size, 2 * intermediate_dim]
     float* batch_gate;           // [max_batch_size, intermediate_dim]
     float* batch_up;             // [max_batch_size, intermediate_dim]
-    float* batch_gate_up;        // [max_batch_size, intermediate_dim]
+    hip_bfloat16* batch_gate_up;        // [max_batch_size, intermediate_dim]
 
 } BatchState;
 
 int NUM_GPUS = 2;
-const int MAX_BATCH_SIZE = 128;
+const int MAX_BATCH_SIZE = 480;
 BatchState* batch_states = NULL;
 TransformerWeights* transformer_weights = NULL;
 
@@ -89,50 +94,33 @@ TransformerWeights* transformer_weights = NULL;
 
 // ------------------------ GPU allocations / deallocations ------------------------
 
-static void to_device(float **dptr, const float *hptr, size_t nbytes) {
+template<typename T>
+static void to_device(T **dptr, const T *hptr, long long nbytes) {
   HIP_CHECK(hipMalloc((void**)dptr, nbytes));
   HIP_CHECK(hipMemcpy(*dptr, hptr, nbytes, hipMemcpyHostToDevice));
 }
 
-static void to_device_and_transpose(float **dptr, const float *hptr, int n, int rows, int cols) {
-  long long total_elems = 1ll * n * rows * cols;
-  HIP_CHECK(hipMalloc((void**)dptr, total_elems * sizeof(float)));
-  float *tmp = (float*)malloc(total_elems * sizeof(float));
-
-  // transpose
-  #pragma omp parallel for
-  for (int i = 0; i < n; i++) {
-    const float *s = hptr + (long long)i * rows * cols;
-    float *d = tmp + (long long)i * rows * cols;
-    for (int r = 0; r < rows; r++) {
-      for (int c = 0; c < cols; c++) {
-        d[c * rows + r] = s[r * cols + c];
-      }
-    }
-  }
-
-  HIP_CHECK(hipMemcpy(*dptr, tmp, total_elems * sizeof(float), hipMemcpyHostToDevice));
-  free(tmp);
-}
-
-static void alloc_device(float **dptr, size_t nbytes, float fill=0.f, bool do_set=false) {
+template<typename T>
+static void alloc_device(T **dptr, long long nbytes, T fill, bool do_set = false) {
   HIP_CHECK(hipMalloc((void**)dptr, nbytes));
   if (do_set) {
-    int n = (int)(nbytes / sizeof(float));
+    long long n = nbytes / sizeof(T);
     set(*dptr, fill, n);
   }
 }
-  
-void free_float_device(float *&p) {
+
+template<typename T>
+void free_device(T *&p) {
   if (p) {
     hipFree(p);
     p = nullptr; 
   } 
 }
 
-void free_int_device(int *&p) {
+template <typename T>
+void free_host(T *&p) {
   if (p) {
-    hipFree(p);
+    free(p);
     p = nullptr; 
   }
 }
@@ -153,12 +141,20 @@ static void convert_fp32_to_bf16_host_and_transpose(const float *src, hip_bfloat
   for (int i = 0; i < n; i++) {
     const float *s = src + (long long)i * rows * cols;
     hip_bfloat16 *d = dst + (long long)i * rows * cols;
-    for (int r = 0; r < rows; r++) {
-      for (int c = 0; c < cols; c++) {
+    for (int r = 0; r < rows; ++r) {
+      for (int c = 0; c < cols; ++c) {
         d[c * rows + r] = hip_bfloat16(s[r * cols + c]);
       }
     }
   }
+}
+
+long long max4(long long a, long long b, long long c, long long d) {
+  long long v = a;
+  if (b > v) v = b;
+  if (c > v) v = c;
+  if (d > v) v = d;
+  return v;
 }
 
 void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, BatchState *g_batch_state) {
@@ -166,11 +162,23 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
   int n_layers = cfg->n_layers;
   int n_experts = cfg->n_experts;
 
+  long long size_tmp = max4(
+    1ll * cfg->vocab_size * cfg->hidden_dim,
+    1ll * n_layers * cfg->hidden_dim * (head_dim * (cfg->n_attn_heads + 2 * cfg->n_kv_heads)),
+    1ll * n_layers * cfg->hidden_dim * n_experts,
+    1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim
+  );
+  hip_bfloat16 *tmp = (hip_bfloat16*)malloc(size_tmp * sizeof(hip_bfloat16));
+  if (!tmp) {
+      fprintf(stderr, "OOM: cannot allocate host FP16 buffer for tmp\n");
+      exit(1);
+  }
+
   to_device(&w->token_embedding_table, ptr, 1ll*cfg->vocab_size*cfg->hidden_dim*sizeof(float));
   ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
 
-  // to_device(&w->out, ptr, 1ll*cfg->vocab_size*cfg->hidden_dim*sizeof(float));
-  to_device_and_transpose(&w->out, ptr, 1, cfg->vocab_size, cfg->hidden_dim);
+  convert_fp32_to_bf16_host_and_transpose(ptr, tmp, 1, cfg->vocab_size, cfg->hidden_dim);
+  to_device(&g_batch_state->d_w_out_bf16, tmp, 1ll * cfg->vocab_size * cfg->hidden_dim * sizeof(hip_bfloat16));
   ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
 
   to_device(&w->rms_attn_w, ptr, 1ll * n_layers * cfg->hidden_dim * sizeof(float));
@@ -179,14 +187,17 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
   ptr += 1ll * n_layers * cfg->hidden_dim;
   to_device(&w->rms_out_w, ptr, 1ll * cfg->hidden_dim * sizeof(float));
   ptr += 1ll * cfg->hidden_dim;
-  // hey it's qkvqkv, not qqkkvv
-  // to_device(&w->w_qkv, ptr,
-  //           1ll * n_layers * cfg->hidden_dim *
-  //           (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads) *
-  //           sizeof(float));
-  to_device_and_transpose(&w->w_qkv, ptr, n_layers,
-                          head_dim * (cfg->n_attn_heads + 2 * cfg->n_kv_heads), 
-                          cfg->hidden_dim);
+
+  convert_fp32_to_bf16_host_and_transpose(
+    ptr, tmp, n_layers,
+    head_dim * (cfg->n_attn_heads + 2 * cfg->n_kv_heads), 
+    cfg->hidden_dim
+  );
+  to_device(
+    &g_batch_state->d_w_qkv_bf16, tmp, 
+    1ll * n_layers * cfg->hidden_dim * head_dim *
+    (cfg->n_attn_heads + 2 * cfg->n_kv_heads) * sizeof(hip_bfloat16)
+  );
   ptr += 1ll * n_layers * cfg->hidden_dim *
          (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
 
@@ -196,12 +207,15 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
   ptr += 1ll * n_layers *
          (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
 
-  // to_device(&w->w_o, ptr,
-  //           1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim *
-  //           sizeof(float));
-  to_device_and_transpose(&w->w_o, ptr, n_layers,
-                          cfg->hidden_dim,
-                          head_dim * cfg->n_attn_heads);
+  convert_fp32_to_bf16_host_and_transpose(
+    ptr, tmp, n_layers,
+    cfg->hidden_dim,
+    head_dim * cfg->n_attn_heads
+  );
+  to_device(
+    &g_batch_state->d_w_o_bf16, tmp,
+    1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim * sizeof(hip_bfloat16)
+  );
   ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
 
   to_device(&w->b_o, ptr, 1ll * n_layers * cfg->hidden_dim * sizeof(float));
@@ -209,27 +223,19 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
   to_device(&w->attn_sinks, ptr, 1ll * n_layers * cfg->n_attn_heads * sizeof(float));
   ptr += 1ll * n_layers * cfg->n_attn_heads;
 
-  // to_device(&w->w_router, ptr, 1ll * n_layers * cfg->hidden_dim * n_experts * sizeof(float));
-  to_device_and_transpose(&w->w_router, ptr, n_layers, n_experts, cfg->hidden_dim);
+  convert_fp32_to_bf16_host_and_transpose(ptr, tmp, n_layers, n_experts, cfg->hidden_dim);
+  to_device(&g_batch_state->d_w_router_bf16, tmp, 1ll * n_layers * n_experts * cfg->hidden_dim * sizeof(hip_bfloat16));
   ptr += 1ll * n_layers * cfg->hidden_dim * n_experts;
   
   to_device(&w->b_router, ptr, 1ll * n_layers * n_experts * sizeof(float));
   ptr += 1ll * n_layers * n_experts;
     
   long long elems_w_mlp1 = 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
-    
-  hip_bfloat16 *tmp = (hip_bfloat16*)malloc(elems_w_mlp1 * sizeof(hip_bfloat16));
-  if (!tmp) {
-      fprintf(stderr, "OOM: cannot allocate host FP16 buffer for w_mlp1\n");
-      exit(1);
-  }
 
   // convert_fp32_to_bf16_host(ptr, tmp, elems_w_mlp1);
   convert_fp32_to_bf16_host_and_transpose(ptr, tmp, n_layers * n_experts, 2 * cfg->intermediate_dim, cfg->hidden_dim);
 
-  HIP_CHECK(hipMalloc(&g_batch_state->d_w_mlp1_bf16, elems_w_mlp1 * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMemcpy(g_batch_state->d_w_mlp1_bf16, tmp, elems_w_mlp1 * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
-
+  to_device(&g_batch_state->d_w_mlp1_bf16, tmp, elems_w_mlp1 * sizeof(hip_bfloat16));
   ptr += elems_w_mlp1;
   
   to_device(&w->b_mlp1, ptr, 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * sizeof(float));
@@ -240,9 +246,7 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
   // convert_fp32_to_bf16_host(ptr, tmp, elems_w_mlp2);
   convert_fp32_to_bf16_host_and_transpose(ptr, tmp, n_layers * n_experts, cfg->hidden_dim, cfg->intermediate_dim);
 
-  HIP_CHECK(hipMalloc(&g_batch_state->d_w_mlp2_bf16, elems_w_mlp2 * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMemcpy(g_batch_state->d_w_mlp2_bf16, tmp, elems_w_mlp2 * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
-
+  to_device(&g_batch_state->d_w_mlp2_bf16, tmp, elems_w_mlp2 * sizeof(hip_bfloat16));
   ptr += elems_w_mlp2;
   
   free(tmp);
@@ -252,40 +256,34 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
 }
 
 static void free_weights_gpu(TransformerWeights &w, BatchState *g_batch_state) {
-  free_float_device(w.token_embedding_table); 
+  free_device(w.token_embedding_table); 
   
-  free_float_device(w.rms_attn_w); 
-  free_float_device(w.rms_ffn_w); 
+  free_device(w.rms_attn_w); 
+  free_device(w.rms_ffn_w); 
     
-  free_float_device(w.w_qkv); 
-  free_float_device(w.b_qkv);
+  // free_device(w.w_qkv); 
+  free_device(g_batch_state->d_w_qkv_bf16);
+  free_device(w.b_qkv);
 
-  free_float_device(w.w_o); 
-  free_float_device(w.b_o); 
+  // free_device(w.w_o); 
+  free_device(g_batch_state->d_w_o_bf16);
+  free_device(w.b_o); 
     
-  free_float_device(w.attn_sinks); 
+  free_device(w.attn_sinks); 
     
-  free_float_device(w.w_router); 
-  free_float_device(w.b_router);
+  // free_device(w.w_router); 
+  free_device(g_batch_state->d_w_router_bf16);
+  free_device(w.b_router);
     
-  // free_float_device(w.w_mlp1); 
-  free_float_device(w.b_mlp1); 
-    
-  // free_float_device(w.w_mlp2);
-  free_float_device(w.b_mlp2); 
-    
-  free_float_device(w.rms_out_w); 
-  free_float_device(w.out);
+  free_device(g_batch_state->d_w_mlp1_bf16);
+  free_device(w.b_mlp1); 
 
-  if (g_batch_state->d_w_mlp1_bf16) {
-    hipFree(g_batch_state->d_w_mlp1_bf16);
-    g_batch_state->d_w_mlp1_bf16 = nullptr;
-  }
-
-  if (g_batch_state->d_w_mlp2_bf16) {
-    hipFree(g_batch_state->d_w_mlp2_bf16);
-    g_batch_state->d_w_mlp2_bf16 = nullptr;
-  }
+  free_device(g_batch_state->d_w_mlp2_bf16);
+  free_device(w.b_mlp2); 
+    
+  free_device(w.rms_out_w); 
+  // free_device(w.out);
+  free_device(g_batch_state->d_w_out_bf16);
 }
 
 // -------------------------- BatchState management --------------------------
@@ -313,7 +311,7 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
 
   // Embedding/residual stream
   alloc_device(&bs.batch_x, 1ll * B * H * sizeof(float), 0.f, true);
-  alloc_device(&bs.batch_t, 1ll * B * H * sizeof(float), 0.f, true);
+  alloc_device(&bs.batch_t, 1ll * B * H * sizeof(hip_bfloat16), hip_bfloat16(0.f), true);
 
   // Attention projections
   alloc_device(&bs.batch_qkv, 1ll * B * qkv_tot * sizeof(float), 0.f, true);
@@ -322,19 +320,20 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
   // Attention caches: [n_layers, MAX_BATCH_SIZE, seq_len, kv_dim]
   {
     const long long cache_elems = 1ll * c.n_layers * B * c.seq_len * kv_dim;
-    alloc_device(&bs.batch_k, cache_elems * sizeof(float), 0.f, true);
-    alloc_device(&bs.batch_v, cache_elems * sizeof(float), 0.f, true);
+    alloc_device(&bs.batch_k, cache_elems * sizeof(hip_bfloat16), hip_bfloat16(0.f), true);
+    alloc_device(&bs.batch_v, cache_elems * sizeof(hip_bfloat16), hip_bfloat16(0.f), true);
   }
 
   // Attention scores & outputs
   alloc_device(&bs.batch_att, 1ll * B * Hq * (c.seq_len + 1) * sizeof(float), 0.f, true); // +1 cho sink
-  alloc_device(&bs.batch_tb, 1ll * B * (D * Hq) * sizeof(float), 0.f, true);
+  alloc_device(&bs.batch_tb, 1ll * B * (D * Hq) * sizeof(hip_bfloat16), hip_bfloat16(0.f), true);
+  alloc_device(&bs.batch_tb2, 1ll * B * H * sizeof(float), 0.f, true);
 
   // MLP / MoE
   alloc_device(&bs.batch_router_score, 1ll * B * c.n_experts * sizeof(float), 0.f, true);
 
-  HIP_CHECK(hipMalloc((void**)&bs.batch_topk_v, 1ll * B * c.experts_per_token * sizeof(float)));
-  HIP_CHECK(hipMalloc((void**)&bs.batch_topk_i, 1ll * B * c.experts_per_token * sizeof(int)));
+  alloc_device(&bs.batch_topk_v, 1ll * B * c.experts_per_token * sizeof(float), 0.f, true);
+  alloc_device(&bs.batch_topk_i, 1ll * B * c.experts_per_token * sizeof(int), 0, true);
   
   // Logits buffer (device) + map host con trỏ
   alloc_device(&bs.batch_logits, 1ll * B * c.vocab_size * sizeof(float), 0.f, true);
@@ -343,7 +342,6 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
   }
 
   if (c.sliding_window > 0) {
-    alloc_device(&bs.mask, 1ll*c.seq_len*c.seq_len*sizeof(float), 0.f, true);
     // host-init mask once then copy
     float *hmask = (float*)malloc(1ll*c.seq_len*c.seq_len*sizeof(float));
     for (int i=0;i<c.seq_len;i++) for (int j=0;j<c.seq_len;j++) {
@@ -351,7 +349,7 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
       if (c.sliding_window > 0 && i - j >= c.sliding_window) v = -INFINITY;
       hmask[i*c.seq_len + j] = v;
     }
-    HIP_CHECK(hipMemcpy(bs.mask, hmask, 1ll*c.seq_len*c.seq_len*sizeof(float), hipMemcpyHostToDevice));
+    to_device(&bs.mask, hmask, 1ll * c.seq_len * c.seq_len * sizeof(float));
     free(hmask);
   } else {
     bs.mask = nullptr;
@@ -361,101 +359,65 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
   int I = c.intermediate_dim;
 
   bs.h_counts = (int*)malloc(E * sizeof(int));
-
-  HIP_CHECK(hipMalloc((void**)&bs.d_counts, E * sizeof(int)));
-  HIP_CHECK(hipMemset(bs.d_counts, 0, E * sizeof(int)));
-
-  HIP_CHECK(hipMalloc((void**)&bs.d_idx_in_batch, E * B * sizeof(int)));
-  HIP_CHECK(hipMemset(bs.d_idx_in_batch, 0, E * B * sizeof(int)));
   
-  HIP_CHECK(hipMalloc((void**)&bs.d_in_ptrs, E * B * sizeof(float*)));
-  HIP_CHECK(hipMemset(bs.d_in_ptrs, 0, E * B * sizeof(float*)));
+  alloc_device(&bs.d_counts, E * sizeof(int), 0, true);
+  alloc_device(&bs.d_idx_in_batch, E * B * sizeof(int), 0, true);
+  
+  HIP_CHECK(hipMalloc((void**)&bs.d_in_ptrs, E * B * sizeof(hip_bfloat16*)));
+  HIP_CHECK(hipMemset(bs.d_in_ptrs, 0, E * B * sizeof(hip_bfloat16*)));
 
   alloc_device(&bs.d_wexps, E * B * sizeof(float), 0.f, true);
   
   alloc_device(&bs.batch_mlp1_out, 1ll * B * (2 * I) * sizeof(float), 0.f, true);
   alloc_device(&bs.batch_gate, 1ll * B * I * sizeof(float), 0.f, true);
   alloc_device(&bs.batch_up, 1ll * B * I * sizeof(float), 0.f, true);
-  alloc_device(&bs.batch_gate_up, 1ll * B * I * sizeof(float), 0.f, true);
+  alloc_device(&bs.batch_gate_up, 1ll * B * I * sizeof(hip_bfloat16), hip_bfloat16(0.f), true);
   alloc_device(&bs.d_out, 1ll * E * B * H * sizeof(float), 0.f, true);
 }
 
 static void free_batchstate_on_device(BatchState &bs) {
   // Device frees
-  free_float_device(bs.batch_x);
-  free_float_device(bs.batch_t);
-  free_float_device(bs.batch_qkv);
-  free_float_device(bs.batch_q);
-  free_float_device(bs.batch_k);
-  free_float_device(bs.batch_v);
-  free_float_device(bs.batch_att);
-  free_float_device(bs.batch_tb);
-  free_float_device(bs.batch_router_score);
-  free_int_device(bs.batch_topk_i);
-  free_float_device(bs.batch_topk_v);
-  free_float_device(bs.batch_logits);
-  free_float_device(bs.mask);
+  free_device(bs.batch_x);
+  free_device(bs.batch_t);
+  free_device(bs.batch_qkv);
+  free_device(bs.batch_q);
+  free_device(bs.batch_k);
+  free_device(bs.batch_v);
+  free_device(bs.batch_att);
+  free_device(bs.batch_tb);
+  free_device(bs.batch_tb2);
+  free_device(bs.batch_router_score);
+  free_device(bs.batch_topk_i);
+  free_device(bs.batch_topk_v);
+  free_device(bs.batch_logits);
+  free_device(bs.mask);
   
-  free_int_device(bs.d_counts);
-  free_int_device(bs.d_idx_in_batch);
-  free_float_device(bs.d_wexps);
-  free_float_device(bs.d_out);
-  free_float_device(bs.batch_mlp1_out);
-  free_float_device(bs.batch_gate);
-  free_float_device(bs.batch_up);
-  free_float_device(bs.batch_gate_up);
-  if (bs.d_in_ptrs) {
-    HIP_CHECK(hipFree(bs.d_in_ptrs));
-    bs.d_in_ptrs = nullptr;
-  }
-
-  if (bs.h_counts) {
-    free(bs.h_counts);
-    bs.h_counts = nullptr;
-  }
+  free_device(bs.d_counts);
+  free_device(bs.d_idx_in_batch);
+  free_device(bs.d_wexps);
+  free_device(bs.d_out);
+  free_device(bs.batch_mlp1_out);
+  free_device(bs.batch_gate);
+  free_device(bs.batch_up);
+  free_device(bs.batch_gate_up);
+  free_device(bs.d_in_ptrs);
+  free_host(bs.h_counts);
 
   // Host frees
   if (bs.prompt_tokens) {
     for (int i = 0; i < MAX_BATCH_SIZE; ++i) {
-      if (bs.prompt_tokens[i]) {
-        free(bs.prompt_tokens[i]);
-        bs.prompt_tokens[i] = NULL; 
-      }
+      free_host(bs.prompt_tokens[i]);
     }
 
-    free(bs.prompt_tokens); 
-    bs.prompt_tokens = NULL;
+    free_host(bs.prompt_tokens);
   }
 
-  if (bs.positions) {
-    free(bs.positions);
-    bs.positions = NULL;
-  }
-
-  if (bs.num_prompt_tokens) {
-    free(bs.num_prompt_tokens);
-    bs.num_prompt_tokens = NULL;
-  }
-
-  if (bs.current_tokens) {
-    free(bs.current_tokens);
-    bs.current_tokens = NULL;
-  }
-
-  if (bs.finished) {
-    free(bs.finished);
-    bs.finished = NULL;
-  }
-
-  if (bs.logits_batch) {
-    free(bs.logits_batch);
-    bs.logits_batch = NULL;
-  }
-
-  if (bs.req_ids) {
-    free(bs.req_ids); 
-    bs.req_ids = NULL;
-  }
+  free_host(bs.positions);
+  free_host(bs.num_prompt_tokens);
+  free_host(bs.current_tokens);
+  free_host(bs.finished);
+  free_host(bs.logits_batch);
+  free_host(bs.req_ids);
 
 }
 
@@ -479,23 +441,22 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int i = 0; i < NUM_GPUS; ++i) {
     HIP_CHECK(hipSetDevice(i));
     BatchState *g_batch_state = &batch_states[i];
+    alloc_batchstate_on_device(*g_batch_state, c);
 
     float *weights_ptr = transformer->data + sizeof(c) / sizeof(float);
     memory_map_weights_gpu(&transformer_weights[i], &c, weights_ptr, g_batch_state);
 
-    alloc_batchstate_on_device(*g_batch_state, c);
-
-    HIP_CHECK(hipMalloc(&g_batch_state->d_current_tokens, MAX_BATCH_SIZE * sizeof(int)));
-    HIP_CHECK(hipMalloc(&g_batch_state->d_positions, MAX_BATCH_SIZE * sizeof(int)));
+    alloc_device(&g_batch_state->d_current_tokens, MAX_BATCH_SIZE * sizeof(int), 0, true);
+    alloc_device(&g_batch_state->d_positions, MAX_BATCH_SIZE * sizeof(int), 0, true);
     
     const int half = c.head_dim / 2;
-    HIP_CHECK(hipMalloc(&g_batch_state->cosB, MAX_BATCH_SIZE * half * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_batch_state->sinB, MAX_BATCH_SIZE * half * sizeof(float)));
+    alloc_device(&g_batch_state->cosB, MAX_BATCH_SIZE * half * sizeof(float), 0.f, true);
+    alloc_device(&g_batch_state->sinB, MAX_BATCH_SIZE * half * sizeof(float), 0.f, true);
 
     g_batch_state->h_p = (float*)malloc(c.vocab_size * sizeof(float));
       
-    HIP_CHECK(hipMalloc(&g_batch_state->g_inv_freq_dev, half * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_batch_state->d_conc, sizeof(float)));
+    alloc_device(&g_batch_state->g_inv_freq_dev, half * sizeof(float), 0.f, true);
+    alloc_device(&g_batch_state->d_conc, sizeof(float), 0.f, true);
   }
 }
 
@@ -515,15 +476,15 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 
     free_batchstate_on_device(*g_batch_state);
 
-    HIP_CHECK(hipFree(g_batch_state->d_current_tokens));
-    HIP_CHECK(hipFree(g_batch_state->d_positions));
-    HIP_CHECK(hipFree(g_batch_state->cosB));
-    HIP_CHECK(hipFree(g_batch_state->sinB));
+    free_device(g_batch_state->d_current_tokens);
+    free_device(g_batch_state->d_positions);
+    free_device(g_batch_state->cosB);
+    free_device(g_batch_state->sinB);
 
-    free(g_batch_state->h_p);
+    free_host(g_batch_state->h_p);
 
-    HIP_CHECK(hipFree(g_batch_state->g_inv_freq_dev));
-    HIP_CHECK(hipFree(g_batch_state->d_conc));
+    free_device(g_batch_state->g_inv_freq_dev);
+    free_device(g_batch_state->d_conc);
   }
 
   free(transformer_weights);

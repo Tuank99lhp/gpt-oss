@@ -46,38 +46,69 @@ void set(T *x, T v, int n) {
   hipLaunchKernelGGL(k_set, dim3(GS), dim3(BS), 0, 0, x, v, n);
 }
 
-__global__ void k_set_vec(float *x, float *v, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) x[i] = v[i];
-}
-
-void set_vec(float *x, float *v, int n) {
-  const int BS = 256, GS = (n + BS - 1) / BS;
-  hipLaunchKernelGGL(k_set_vec, dim3(GS), dim3(BS), 0, 0, x, v, n);
-}
-
 int ceil_div(int n, int d) { return (n + d - 1) / d; }
 
 // MFMA accumulator type: vector of 4 float (matches builtin return type)
 using v4f32 = float __attribute__((__vector_size__(4 * sizeof(float))));
+using v4i16  = short __attribute__((__vector_size__(4 * sizeof(short))));
 
-// BF16 -> F32 fast convert (weight-friendly)
 __device__ __forceinline__ float bf16_to_f32(hip_bfloat16 h) {
-  uint16_t lo = *reinterpret_cast<const uint16_t*>(&h);
-  uint32_t hi = (uint32_t)lo << 16;
-  return __uint_as_float(hi);
+  return float(h);
 }
 
-// Convert 4×bf16 packed in one uint64 -> 4×f32
-__device__ __forceinline__ void bf16x4_u64_to_f4(uint64_t u, float &x0, float &x1, float &x2, float &x3) {
-  uint32_t lo = (uint32_t)(u & 0xFFFFFFFFull);
-  uint32_t hi = (uint32_t)(u >> 32);
-  uint32_t h0 = (lo & 0x0000FFFFu) << 16;
-  uint32_t h1 = (lo & 0xFFFF0000u);
-  uint32_t h2 = (hi & 0x0000FFFFu) << 16;
-  uint32_t h3 = (hi & 0xFFFF0000u);
-  x0 = __uint_as_float(h0);
-  x1 = __uint_as_float(h1);
-  x2 = __uint_as_float(h2);
-  x3 = __uint_as_float(h3);
+__device__ __forceinline__ hip_bfloat16 f32_to_bf16(float x) {
+  return hip_bfloat16(x);
+}
+
+__device__ __forceinline__ void gld_bf16x4(const hip_bfloat16* p,
+                                           hip_bfloat16& a,
+                                           hip_bfloat16& b,
+                                           hip_bfloat16& c,
+                                           hip_bfloat16& d) {
+  const bool aligned8 = ((((uintptr_t)p) & 0x7) == 0);
+
+  if (aligned8) {
+    const uint64_t u  = *reinterpret_cast<const uint64_t*>(p);
+    const uint32_t lo = static_cast<uint32_t>(u);
+    const uint32_t hi = static_cast<uint32_t>(u >> 32);
+
+    const uint16_t a16 = static_cast<uint16_t>(lo & 0xFFFFu);
+    const uint16_t b16 = static_cast<uint16_t>(lo >> 16);
+    const uint16_t c16 = static_cast<uint16_t>(hi & 0xFFFFu);
+    const uint16_t d16 = static_cast<uint16_t>(hi >> 16);
+
+    *reinterpret_cast<uint16_t*>(&a) = a16;
+    *reinterpret_cast<uint16_t*>(&b) = b16;
+    *reinterpret_cast<uint16_t*>(&c) = c16;
+    *reinterpret_cast<uint16_t*>(&d) = d16;
+  } else {
+    a = p[0];
+    b = p[1];
+    c = p[2];
+    d = p[3];
+  }
+}
+
+__device__ __forceinline__ v4i16 pack_bf16x4_vec(hip_bfloat16 x0, hip_bfloat16 x1,
+                                                 hip_bfloat16 x2, hip_bfloat16 x3) {
+  // Lấy raw 16-bit của hip_bfloat16 rồi đóng gói vào short4
+  uint16_t r0 = *reinterpret_cast<const uint16_t*>(&x0);
+  uint16_t r1 = *reinterpret_cast<const uint16_t*>(&x1);
+  uint16_t r2 = *reinterpret_cast<const uint16_t*>(&x2);
+  uint16_t r3 = *reinterpret_cast<const uint16_t*>(&x3);
+  v4i16 v = { (short)r0, (short)r1, (short)r2, (short)r3 };
+  return v;
+}
+
+__device__ __forceinline__ Float4 gld_f32x4(const float* p) {
+  Float4 v;
+  if ((((uintptr_t)p) & 0xF) == 0) {
+    v = *reinterpret_cast<const Float4*>(p);
+  } else {
+    v.x = p[0];
+    v.y = p[1];
+    v.z = p[2];
+    v.w = p[3];
+  }
+  return v;
 }

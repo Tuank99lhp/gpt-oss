@@ -1,7 +1,6 @@
 #include "batch_hip/rms_norm.cpp"
-#include "batch_hip/matmul_bf16_X1D.cpp"
-#include "batch_hip/matmul_bf16_X2D.cpp"
-#include "batch_hip/matmul_fp32.cpp"
+#include "batch_hip/matmul_bf16_out_fp32.cpp"
+#include "batch_hip/matmul_bf16_out_fp32_X2D.cpp"
 #include "batch_hip/add_bias.cpp"
 #include "batch_hip/split_qkv.cpp"
 #include "batch_hip/axpy.cpp"
@@ -15,6 +14,48 @@
 #include "batch_hip/moe.cpp"
 
 static bool first_print = true;
+
+inline void GemmQKV(
+    float* Y, const hip_bfloat16* X, const hip_bfloat16* W,
+    int K, int M, int B, hipStream_t s = 0)
+{
+  gemm_gpu_batch_bf16core_yfp32<240, 64, 128, 15, 1>(Y, X, W, K, M, B, s);
+}
+
+inline void GemmO(
+    float* Y, const hip_bfloat16* X, const hip_bfloat16* W,
+    int K, int M, int B, hipStream_t s = 0)
+{
+  gemm_gpu_batch_bf16core_yfp32<256, 64, 256, 16, 1>(Y, X, W, K, M, B, s);
+}
+
+inline void GemmRouter(
+    float* Y, const hip_bfloat16* X, const hip_bfloat16* W,
+    int K, int M, int B, hipStream_t s = 0)
+{
+  gemm_gpu_batch_bf16core_yfp32<128, 16, 512, 8, 1>(Y, X, W, K, M, B, s);
+}
+
+inline void GemmMlp1(
+    float* Y, const hip_bfloat16* const* X, const hip_bfloat16* W,
+    int K, int M, int B, hipStream_t s = 0)
+{
+  gemm_gpu_batch_bf16core_yfp32_X2D<256, 64, 128, 16, 1>(Y, X, W, K, M, B, s);
+}
+
+inline void GemmMlp2(
+    float* Y, const hip_bfloat16* X, const hip_bfloat16* W,
+    int K, int M, int B, hipStream_t s = 0)
+{
+  gemm_gpu_batch_bf16core_yfp32<256, 64, 128, 16, 1>(Y, X, W, K, M, B, s);
+}
+
+inline void GemmLogits(
+    float* Y, const hip_bfloat16* X, const hip_bfloat16* W,
+    int K, int M, int B, hipStream_t s = 0)
+{
+  gemm_gpu_batch_bf16core_yfp32<256, 64, 128, 16, 1>(Y, X, W, K, M, B, s);
+}
 
 void forward_batch(Transformer *transformer, int batch_size) {
 
@@ -93,7 +134,7 @@ TIME_BLOCK({
     
 TIME_BLOCK({
 
-    rmsnorm_batch_gpu(
+    rmsnorm_batch_gpu_bf16(
       g_batch_state->batch_t,
       g_batch_state->batch_x, 
       w->rms_attn_w + 1ll * l * hidden_dim, 
@@ -105,10 +146,10 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-    gemm_gpu_batch_f32W(
+    GemmQKV(
       g_batch_state->batch_qkv, 
       g_batch_state->batch_t,  
-      w->w_qkv + 1ll * l * hidden_dim * (head_dim * n_qkv_heads),
+      g_batch_state->d_w_qkv_bf16 + 1ll * l * hidden_dim * (head_dim * n_qkv_heads),
       hidden_dim, 
       head_dim * n_qkv_heads, 
       batch_size
@@ -129,7 +170,7 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-    split_qkv_gpu_batch_devicepos(
+    split_qkv_gpu_batch_devicepos_f32q_bf16kv(
       g_batch_state->batch_qkv,
       g_batch_state->batch_q,
       g_batch_state->batch_k,
@@ -162,7 +203,7 @@ TIME_BLOCK({
       head_dim, 0
     );
 
-    rope_apply_k_batch(
+    rope_apply_k_batch_bf16(
       g_batch_state->batch_k,
       cosB, sinB, d_positions,
       batch_size,
@@ -181,7 +222,7 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-    attn_scores_gpu_batch(
+    attn_scores_gpu_batch_bf16k(
       g_batch_state->batch_q,
       g_batch_state->batch_k + 1ll * l * MAX_BATCH_SIZE * p->seq_len * kv_dim,
       use_sw ? g_batch_state->mask : nullptr,
@@ -204,7 +245,7 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-    attn_weighted_sum_gpu_batch(
+    attn_weighted_sum_gpu_batch_bf16v(
       g_batch_state->batch_att,
       g_batch_state->batch_v + 1ll * l * MAX_BATCH_SIZE * p->seq_len * kv_dim,
       g_batch_state->batch_tb,
@@ -213,13 +254,13 @@ TIME_BLOCK({
 
 }, t_attn_weighted_sum);
     
-    const float *Wo = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
+    const hip_bfloat16 *Wo = g_batch_state->d_w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
     const float *Bo = w->b_o + 1ll * l * hidden_dim;
 
 TIME_BLOCK({
 
-    gemm_gpu_batch_f32W(
-      g_batch_state->batch_t,
+    GemmO(
+      g_batch_state->batch_tb2,
       g_batch_state->batch_tb,
       Wo,
       head_dim * p->n_attn_heads, 
@@ -232,7 +273,7 @@ TIME_BLOCK({
 TIME_BLOCK({
 
     add_bias_gpu_batch_broadcast(
-      g_batch_state->batch_t,
+      g_batch_state->batch_tb2,
       Bo,
       batch_size,
       hidden_dim
@@ -244,7 +285,7 @@ TIME_BLOCK({
 
     axpy_gpu_batch(
       g_batch_state->batch_x,
-      g_batch_state->batch_t,
+      g_batch_state->batch_tb2,
       1.0f,
       hidden_dim,
       batch_size
@@ -256,7 +297,7 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-    rmsnorm_batch_gpu(
+    rmsnorm_batch_gpu_bf16(
       g_batch_state->batch_t,
       g_batch_state->batch_x,
       w->rms_ffn_w + l * hidden_dim,
@@ -267,10 +308,10 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-    gemm_gpu_batch_f32W(
+    GemmRouter(
       g_batch_state->batch_router_score,
       g_batch_state->batch_t,
-      w->w_router + l * hidden_dim * p->n_experts,
+      g_batch_state->d_w_router_bf16 + l * hidden_dim * p->n_experts,
       hidden_dim,
       p->n_experts,
       batch_size
@@ -324,7 +365,7 @@ TIME_BLOCK({
 
     set(g_batch_state->d_counts, 0, E);
 
-    moe_assign_from_topk(
+    moe_assign_from_topk_bf16(
       g_batch_state->batch_topk_i,
       g_batch_state->batch_topk_v,
       g_batch_state->batch_t,
@@ -348,11 +389,11 @@ TIME_BLOCK({
       int B = g_batch_state->h_counts[e];
       if (B > 0) {
 
-        float **batch_t_gap = g_batch_state->d_in_ptrs + e * batch_size;
+        hip_bfloat16 **batch_t_gap = g_batch_state->d_in_ptrs + e * batch_size;
         float *batch_mlp1_out = g_batch_state->batch_mlp1_out;
         float *batch_gate = g_batch_state->batch_gate;
         float *batch_up = g_batch_state->batch_up;
-        float *batch_gate_up = g_batch_state->batch_gate_up;
+        hip_bfloat16 *batch_gate_up = g_batch_state->batch_gate_up;
         float *d_out = g_batch_state->d_out + 1ll * e * batch_size * H;
 
         long long offset_l = 1ll * l * p->n_experts + e;
@@ -362,7 +403,7 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-        gemm_gpu_batch_bf16_2(batch_mlp1_out, batch_t_gap, W1_local, H, 2 * I, B);
+        GemmMlp1(batch_mlp1_out, batch_t_gap, W1_local, H, 2 * I, B);
 
 }, t_moe_gemm_mlp1);
 
@@ -380,7 +421,7 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-        swiglu_gpu_batch(batch_gate, batch_up, batch_gate_up, I, 1.702f, p->swiglu_limit, B);
+        swiglu_gpu_batch_bf16(batch_gate, batch_up, batch_gate_up, I, 1.702f, p->swiglu_limit, B);
 
 }, t_moe_swiglu);
 
@@ -389,7 +430,7 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-        gemm_gpu_batch_bf16(d_out, batch_gate_up, W2_local, I, H, B);
+        GemmMlp2(d_out, batch_gate_up, W2_local, I, H, B);
 
 }, t_moe_gemm_mlp2);
 
@@ -419,8 +460,8 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-  rmsnorm_batch_gpu(
-    g_batch_state->batch_x,
+  rmsnorm_batch_gpu_bf16(
+    g_batch_state->batch_t,
     g_batch_state->batch_x,
     w->rms_out_w,
     batch_size,
@@ -431,10 +472,10 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-  gemm_gpu_batch_f32W(
+  GemmLogits(
     g_batch_state->batch_logits,
-    g_batch_state->batch_x,
-    w->out,
+    g_batch_state->batch_t,
+    g_batch_state->d_w_out_bf16,
     hidden_dim,
     p->vocab_size,
     batch_size
@@ -442,7 +483,7 @@ TIME_BLOCK({
 
 }, t_gemm_logits);
 
-  if (!first_print) {
+  if (!first_print || device_id != 0) {
     return;
   }
   first_print = false;

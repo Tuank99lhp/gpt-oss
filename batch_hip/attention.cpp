@@ -125,3 +125,115 @@ static inline void attn_weighted_sum_gpu_batch(const float* attB,
                      attB, v_layer, tbB, d_positions, head_dim, kv_mul,
                      /*row_stride=*/seq_len+1, seq_len, kv_dim, n_heads, B);
 }
+
+// ---------- scores ----------
+__global__ void k_attn_scores_batch(const float*        __restrict__ qB,
+                                    const hip_bfloat16* __restrict__ k_layer,
+                                    const float*        __restrict__ mask,
+                                    float*              __restrict__ attB,
+                                    const int*          __restrict__ positions,
+                                    int head_dim, int kv_mul,
+                                    int seq_len, int kv_dim,
+                                    int n_heads, int row_stride,
+                                    int B, int sliding_window)
+{
+  const int h = blockIdx.x;
+  const int b = blockIdx.y;
+  if (h >= n_heads || b >= B) return;
+
+  const int pos = positions[b];
+  const float inv_sqrt_d = rsqrtf((float)head_dim);
+
+  const float* qh = qB + b * n_heads * head_dim + h * head_dim;
+  float* att_row  = attB + (b * n_heads + h) * row_stride;
+
+  for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
+    const hip_bfloat16* kt = k_layer
+      + (b * seq_len + t) * kv_dim
+      + (h / kv_mul) * head_dim;
+
+    float s = 0.f;
+    #pragma unroll 4
+    for (int i = 0; i < head_dim; ++i) {
+      s = fmaf(qh[i], bf16_to_f32(kt[i]), s);
+    }
+    s *= inv_sqrt_d;
+
+    if (sliding_window > 0 && mask) {
+      s += mask[pos * seq_len + t];
+    }
+    att_row[t] = s;
+  }
+}
+
+// ---------- weighted sum ----------
+__global__ void k_attn_weighted_sum_batch(const float*        __restrict__ attB,
+                                          const hip_bfloat16* __restrict__ v_layer,
+                                          hip_bfloat16*       __restrict__ tbB,
+                                          const int*          __restrict__ positions,
+                                          int head_dim, int kv_mul,
+                                          int row_stride, int seq_len,
+                                          int kv_dim, int n_heads, int B)
+{
+  const int h = blockIdx.x;
+  const int b = blockIdx.y;
+  if (h >= n_heads || b >= B) return;
+
+  const int pos = positions[b];
+  const int row_len = pos + 1;
+
+  const float* att_row = attB + (b * n_heads + h) * row_stride;
+  hip_bfloat16* out_h  = tbB + b * n_heads * head_dim + h * head_dim;
+
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    float acc = 0.f;
+    #pragma unroll 1
+    for (int t = 0; t < row_len; ++t) {
+      const float a = att_row[t];
+      const hip_bfloat16* vt = v_layer
+        + (b * seq_len + t) * kv_dim
+        + (h / kv_mul) * head_dim;
+      acc = fmaf(a, bf16_to_f32(vt[i]), acc);
+    }
+    out_h[i] = f32_to_bf16(acc);
+  }
+}
+
+// ===================== Launchers =====================
+
+static inline void attn_scores_gpu_batch_bf16k(const float*        qB,
+                                         const hip_bfloat16* k_layer,
+                                         const float*        mask,
+                                         float*              attB,
+                                         const int*          d_positions,
+                                         int head_dim, int kv_mul,
+                                         int seq_len, int kv_dim,
+                                         int n_heads, int B,
+                                         int sliding_window,
+                                         hipStream_t stream = 0)
+{
+  const int BS = 256;
+  dim3 block(BS);
+  dim3 grid(n_heads, B, 1);
+  hipLaunchKernelGGL(k_attn_scores_batch, grid, block, 0, stream,
+                     qB, k_layer, mask, attB, d_positions,
+                     head_dim, kv_mul, seq_len, kv_dim,
+                     n_heads, /*row_stride=*/seq_len + 1, B, sliding_window);
+}
+
+static inline void attn_weighted_sum_gpu_batch_bf16v(const float*        attB,
+                                               const hip_bfloat16* v_layer,
+                                               hip_bfloat16*       tbB,
+                                               const int*          d_positions,
+                                               int head_dim, int kv_mul,
+                                               int seq_len, int kv_dim,
+                                               int n_heads, int B,
+                                               hipStream_t stream = 0)
+{
+  const int BS = 256;
+  dim3 block(BS);
+  dim3 grid(n_heads, B, 1);
+  hipLaunchKernelGGL(k_attn_weighted_sum_batch, grid, block, 0, stream,
+                     attB, v_layer, tbB, d_positions, head_dim, kv_mul,
+                     /*row_stride=*/seq_len + 1, seq_len, kv_dim, n_heads, B);
+}
