@@ -75,40 +75,6 @@ __global__ void k_rope_q_batch(float* __restrict__ qB,
   }
 }
 
-// ======= Áp RoPE batched cho K-cache tại pos[b] =======
-// k_all là base ở đầu LAYER l (đã offset theo l) hoặc dùng tham số layer+MAX_BATCH_SIZE để tự tính offset.
-__global__ void k_rope_k_batch(float* __restrict__ k_all, // [L, MAX_BATCH, seq_len, kv_dim]
-                               const float* __restrict__ cosB,
-                               const float* __restrict__ sinB,
-                               const int*   __restrict__ positions,
-                               int B, int n_kv, int head_dim,
-                               int seq_len, int kv_dim,
-                               int layer, int MAX_BATCH_SIZE) {
-  int b = blockIdx.y;        // sample
-  int h = blockIdx.x;        // kv head idx (0..n_kv-1)
-  int tid = threadIdx.x;
-  const int half = head_dim >> 1;
-  if (b >= B || h >= n_kv) return;
-
-  const size_t layer_stride = (size_t)MAX_BATCH_SIZE * (size_t)seq_len * (size_t)kv_dim;
-  float* k_layer = k_all + (size_t)layer * layer_stride;
-
-  const int pos = positions[b];
-  const size_t row = ((size_t)b * (size_t)seq_len + (size_t)pos) * (size_t)kv_dim
-                   + (size_t)h * (size_t)head_dim;
-
-  for (int i = tid; i < half; i += blockDim.x) {
-    float c = cosB[(size_t)b * half + i];
-    float s = sinB[(size_t)b * half + i];
-    float x1 = k_layer[row + i];
-    float x2 = k_layer[row + half + i];
-    float o1 = x1 * c - x2 * s;
-    float o2 = x2 * c + x1 * s;
-    k_layer[row + i]         = o1;
-    k_layer[row + half + i]  = o2;
-  }
-}
-
 static inline void rope_ensure_invfreq(int head_dim, float base,
                                        float scaling_factor, float initial_context_length,
                                        float ntk_beta, float ntk_alpha,
@@ -193,21 +159,6 @@ static inline void rope_apply_q_batch(float* qB, const float* cosB, const float*
                      qB, cosB, sinB, B, n_q, head_dim);
 }
 
-static inline void rope_apply_k_batch(float* k_all, const float* cosB, const float* sinB,
-                                      const int* d_positions,
-                                      int B, int n_kv, int head_dim,
-                                      int seq_len, int kv_dim,
-                                      int layer, int MAX_BATCH_SIZE,
-                                      hipStream_t stream = 0)
-{
-  const int BS = 256;
-  dim3 block(BS);
-  dim3 grid(n_kv, B, 1);
-  hipLaunchKernelGGL(k_rope_k_batch, grid, block, 0, stream,
-                     k_all, cosB, sinB, d_positions,
-                     B, n_kv, head_dim, seq_len, kv_dim, layer, MAX_BATCH_SIZE);
-}
-
 // k_all: [L, MAX_BATCH, seq_len, kv_dim] (bf16), cosB/sinB: [B, head_dim/2] (f32)
 __global__ void k_rope_k_batch_bf16(hip_bfloat16*   __restrict__ k_all,
                                     const float*    __restrict__ cosB,
@@ -215,7 +166,7 @@ __global__ void k_rope_k_batch_bf16(hip_bfloat16*   __restrict__ k_all,
                                     const int*      __restrict__ positions,
                                     int B, int n_kv, int head_dim,
                                     int seq_len, int kv_dim,
-                                    int layer, int MAX_BATCH_SIZE) {
+                                    int layer, int MAX_BATCH_SIZE, int sliding_window) {
   const int b = blockIdx.y;
   const int h = blockIdx.x;
   const int tid = threadIdx.x;
@@ -226,13 +177,18 @@ __global__ void k_rope_k_batch_bf16(hip_bfloat16*   __restrict__ k_all,
 
   const int half = head_dim >> 1;
 
-  const size_t layer_stride = MAX_BATCH_SIZE * seq_len * kv_dim;
+  const size_t layer_stride_odd = MAX_BATCH_SIZE * seq_len * kv_dim;
+  const size_t layer_stride_even = MAX_BATCH_SIZE * sliding_window * kv_dim;
+  const size_t layer_stride = layer / 2 * layer_stride_odd + (layer + 1) / 2 * layer_stride_even;
 
-  hip_bfloat16* k_layer = k_all + layer * layer_stride;
+  hip_bfloat16* k_layer = k_all + layer_stride;
 
-  const int pos = positions[b];
+  int pos = positions[b];
+  if (sliding_window > 0 && layer % 2 == 0) {
+    pos %= sliding_window;
+  }
 
-  const size_t row = (b * seq_len + pos) * kv_dim + h * head_dim;
+  const size_t row = (b * (layer % 2 ? seq_len : sliding_window) + pos) * kv_dim + h * head_dim;
 
   for (int i = tid; i < half; i += blockDim.x) {
     const float c = cosB[b * half + i];
@@ -260,6 +216,7 @@ static inline void rope_apply_k_batch_bf16(hip_bfloat16* k_all,
                                            int kv_dim,
                                            int layer,
                                            int MAX_BATCH_SIZE,
+                                           int sliding_window,
                                            hipStream_t stream = 0) {
   const int BS = 256;
   dim3 block(BS);
@@ -268,6 +225,7 @@ static inline void rope_apply_k_batch_bf16(hip_bfloat16* k_all,
   hipLaunchKernelGGL(
     k_rope_k_batch_bf16, grid, block, 0, stream,
     k_all, cosB, sinB, d_positions,
-    B, n_kv, head_dim, seq_len, kv_dim, layer, MAX_BATCH_SIZE
+    B, n_kv, head_dim, seq_len, kv_dim, layer, 
+    MAX_BATCH_SIZE, sliding_window
   );
 }

@@ -9,7 +9,6 @@
 #include "batch_hip/rope.cpp"
 #include "batch_hip/softmax.cpp"
 #include "batch_hip/top_k.cpp"
-#include "batch_hip/split_gate_up.cpp"
 #include "batch_hip/embedding_batch.cpp"
 #include "batch_hip/moe.cpp"
 
@@ -17,44 +16,44 @@ static bool first_print = true;
 
 inline void GemmQKV(
     float* Y, const hip_bfloat16* X, const hip_bfloat16* W,
-    int K, int M, int B, hipStream_t s = 0)
+    int K, int M, int B, const float* bias = nullptr, hipStream_t s = 0)
 {
-  gemm_gpu_batch_bf16core_yfp32<240, 64, 128, 15, 1>(Y, X, W, K, M, B, s);
+  gemm_gpu_batch_bf16core_yfp32<240, 64, 128, 15, 1>(Y, X, W, K, M, B, bias, s);
 }
 
 inline void GemmO(
     float* Y, const hip_bfloat16* X, const hip_bfloat16* W,
-    int K, int M, int B, hipStream_t s = 0)
+    int K, int M, int B, const float* bias = nullptr, hipStream_t s = 0)
 {
-  gemm_gpu_batch_bf16core_yfp32<256, 64, 256, 16, 1>(Y, X, W, K, M, B, s);
+  gemm_gpu_batch_bf16core_yfp32<256, 64, 256, 16, 1>(Y, X, W, K, M, B, bias, s);
 }
 
 inline void GemmRouter(
     float* Y, const hip_bfloat16* X, const hip_bfloat16* W,
-    int K, int M, int B, hipStream_t s = 0)
+    int K, int M, int B, const float* bias = nullptr, hipStream_t s = 0)
 {
-  gemm_gpu_batch_bf16core_yfp32<128, 16, 512, 8, 1>(Y, X, W, K, M, B, s);
+  gemm_gpu_batch_bf16core_yfp32<128, 16, 512, 8, 1>(Y, X, W, K, M, B, bias, s);
 }
 
 inline void GemmMlp1(
     float* Y, const hip_bfloat16* const* X, const hip_bfloat16* W,
-    int K, int M, int B, hipStream_t s = 0)
+    int K, int M, int B, const float* bias = nullptr, hipStream_t s = 0)
 {
-  gemm_gpu_batch_bf16core_yfp32_X2D<256, 64, 128, 16, 1>(Y, X, W, K, M, B, s);
+  gemm_gpu_batch_bf16core_yfp32_X2D<256, 64, 128, 16, 1>(Y, X, W, K, M, B, bias, s);
 }
 
 inline void GemmMlp2(
     float* Y, const hip_bfloat16* X, const hip_bfloat16* W,
-    int K, int M, int B, hipStream_t s = 0)
+    int K, int M, int B, const float* bias = nullptr, hipStream_t s = 0)
 {
-  gemm_gpu_batch_bf16core_yfp32<256, 64, 128, 16, 1>(Y, X, W, K, M, B, s);
+  gemm_gpu_batch_bf16core_yfp32<256, 64, 128, 16, 1>(Y, X, W, K, M, B, bias, s);
 }
 
 inline void GemmLogits(
     float* Y, const hip_bfloat16* X, const hip_bfloat16* W,
-    int K, int M, int B, hipStream_t s = 0)
+    int K, int M, int B, const float* bias = nullptr, hipStream_t s = 0)
 {
-  gemm_gpu_batch_bf16core_yfp32<256, 64, 128, 16, 1>(Y, X, W, K, M, B, s);
+  gemm_gpu_batch_bf16core_yfp32<256, 64, 128, 16, 1>(Y, X, W, K, M, B, bias, s);
 }
 
 void forward_batch(Transformer *transformer, int batch_size) {
@@ -111,9 +110,9 @@ TIME_BLOCK({
                           batch_size * sizeof(int), hipMemcpyHostToDevice, 0));
                           
   if (hidden_dim % 4 == 0) {
-    embedding_gather_vec4(g_batch_state->batch_x, w->token_embedding_table, d_current_tokens, batch_size, hidden_dim, 0);
+    embedding_gather_vec4(g_batch_state->batch_x, g_batch_state->d_w_token_embedding_table_bf16, d_current_tokens, batch_size, hidden_dim, 0);
   } else {
-    embedding_gather(g_batch_state->batch_x, w->token_embedding_table, d_current_tokens, batch_size, hidden_dim, 0);
+    embedding_gather(g_batch_state->batch_x, g_batch_state->d_w_token_embedding_table_bf16, d_current_tokens, batch_size, hidden_dim, 0);
   }
 
   HIP_CHECK(hipMemcpyAsync(d_positions, g_batch_state->positions,
@@ -152,21 +151,11 @@ TIME_BLOCK({
       g_batch_state->d_w_qkv_bf16 + 1ll * l * hidden_dim * (head_dim * n_qkv_heads),
       hidden_dim, 
       head_dim * n_qkv_heads, 
-      batch_size
+      batch_size,
+      w->b_qkv + 1ll * l * head_dim * n_qkv_heads
     );
 
 }, t_gemm_qkv);
-
-TIME_BLOCK({
-
-    add_bias_gpu_batch_broadcast(
-      g_batch_state->batch_qkv,
-      w->b_qkv + 1ll * l * head_dim * n_qkv_heads,
-      batch_size,
-      head_dim * n_qkv_heads
-    );
-
-}, t_bias_qkv);
 
 TIME_BLOCK({
 
@@ -182,7 +171,8 @@ TIME_BLOCK({
       batch_size,
       p->seq_len,
       l,
-      MAX_BATCH_SIZE
+      MAX_BATCH_SIZE,
+      p->sliding_window
     );
 
 }, t_split_qkv);
@@ -213,7 +203,7 @@ TIME_BLOCK({
       head_dim * p->n_kv_heads,
       l,
       MAX_BATCH_SIZE,
-      0
+      p->sliding_window
     );
 
 }, t_rope);
@@ -223,13 +213,18 @@ TIME_BLOCK({
 TIME_BLOCK({
 
     attn_scores_gpu_batch_bf16k(
-      g_batch_state->batch_q,
-      g_batch_state->batch_k + 1ll * l * MAX_BATCH_SIZE * p->seq_len * kv_dim,
-      use_sw ? g_batch_state->mask : nullptr,
-      g_batch_state->batch_att,
-      d_positions,
-      head_dim, kv_mul, p->seq_len, kv_dim, p->n_attn_heads, batch_size,
-      use_sw ? p->sliding_window : 0, 0);
+    g_batch_state->batch_q,
+    g_batch_state->batch_k,                 // truyền base tổng, wrapper tự offset theo layer
+    use_sw ? g_batch_state->mask : nullptr, // mask[pos, t] hoặc null
+    g_batch_state->batch_att,
+    d_positions,
+    head_dim, kv_mul,
+    p->seq_len, kv_dim,
+    p->n_attn_heads, batch_size,
+    /*layer=*/l,
+    MAX_BATCH_SIZE,
+    p->sliding_window,
+    /*stream=*/0);
 
 }, t_attn_scores);
 
@@ -246,11 +241,17 @@ TIME_BLOCK({
 TIME_BLOCK({
 
     attn_weighted_sum_gpu_batch_bf16v(
-      g_batch_state->batch_att,
-      g_batch_state->batch_v + 1ll * l * MAX_BATCH_SIZE * p->seq_len * kv_dim,
-      g_batch_state->batch_tb,
-      d_positions, head_dim, kv_mul, p->seq_len, kv_dim, p->n_attn_heads, batch_size, 0
-    );
+    g_batch_state->batch_att,
+    g_batch_state->batch_v,          // truyền base tổng; wrapper tự offset theo layer
+    g_batch_state->batch_tb,
+    d_positions,
+    head_dim, kv_mul,
+    p->seq_len, kv_dim,
+    p->n_attn_heads, batch_size,
+    /*layer=*/l,
+    MAX_BATCH_SIZE,
+    p->sliding_window,
+    /*stream=*/0);
 
 }, t_attn_weighted_sum);
     
@@ -265,21 +266,11 @@ TIME_BLOCK({
       Wo,
       head_dim * p->n_attn_heads, 
       hidden_dim, 
-      batch_size
+      batch_size,
+      Bo
     );
 
 }, t_gemm_o);
-
-TIME_BLOCK({
-
-    add_bias_gpu_batch_broadcast(
-      g_batch_state->batch_tb2,
-      Bo,
-      batch_size,
-      hidden_dim
-    );
-
-}, t_bias_o);
 
 TIME_BLOCK({
 
@@ -314,21 +305,11 @@ TIME_BLOCK({
       g_batch_state->d_w_router_bf16 + l * hidden_dim * p->n_experts,
       hidden_dim,
       p->n_experts,
-      batch_size
+      batch_size,
+      w->b_router + l * p->n_experts
     );
 
 }, t_gemm_router);
-
-TIME_BLOCK({
-
-    add_bias_gpu_batch_broadcast(
-      g_batch_state->batch_router_score,
-      w->b_router + l * p->n_experts,
-      batch_size,
-      p->n_experts
-    );
-
-}, t_bias_router);
 
 TIME_BLOCK({
 
@@ -391,8 +372,6 @@ TIME_BLOCK({
 
         hip_bfloat16 **batch_t_gap = g_batch_state->d_in_ptrs + e * batch_size;
         float *batch_mlp1_out = g_batch_state->batch_mlp1_out;
-        float *batch_gate = g_batch_state->batch_gate;
-        float *batch_up = g_batch_state->batch_up;
         hip_bfloat16 *batch_gate_up = g_batch_state->batch_gate_up;
         float *d_out = g_batch_state->d_out + 1ll * e * batch_size * H;
 
@@ -403,25 +382,20 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-        GemmMlp1(batch_mlp1_out, batch_t_gap, W1_local, H, 2 * I, B);
+        GemmMlp1(batch_mlp1_out, batch_t_gap, W1_local, H, 2 * I, B, B1_local);
 
 }, t_moe_gemm_mlp1);
 
 TIME_BLOCK({
 
-        add_bias_gpu_batch_broadcast(batch_mlp1_out, B1_local, B, 2 * I);
-
-}, t_moe_bias_mlp1);
-
-TIME_BLOCK({
-
-        split_gate_up(batch_mlp1_out, batch_gate, batch_up, I * B);
-
-}, t_moe_split_gate_up);
-
-TIME_BLOCK({
-
-        swiglu_gpu_batch_bf16(batch_gate, batch_up, batch_gate_up, I, 1.702f, p->swiglu_limit, B);
+        swiglu_fused_gpu_batch_bf16(
+          batch_mlp1_out,     // float*, kích thước 2 * I * B (g,u xen kẽ)
+          batch_gate_up,      // hip_bfloat16*, kích thước I * B
+          I, B,
+          /*alpha=*/1.702f,
+          /*clampv=*/p->swiglu_limit,
+          /*stream=*/0
+        );
 
 }, t_moe_swiglu);
 
@@ -430,15 +404,9 @@ TIME_BLOCK({
 
 TIME_BLOCK({
 
-        GemmMlp2(d_out, batch_gate_up, W2_local, I, H, B);
+        GemmMlp2(d_out, batch_gate_up, W2_local, I, H, B, B2_local);
 
 }, t_moe_gemm_mlp2);
-
-TIME_BLOCK({
-
-        add_bias_gpu_batch_broadcast(d_out, B2_local, B, H);
-
-}, t_moe_bias_mlp2);
 
       }
     }
@@ -492,30 +460,21 @@ TIME_BLOCK({
   printf("[PROFILE] Embedding: %.3f ms\n", t_embedding);
   printf("[PROFILE] RMSNorm1: %.3f ms\n", t_rmsnorm);
   printf("[PROFILE] Gemm QKV: %.3f ms\n", t_gemm_qkv);
-  printf("[PROFILE] Bias QKV: %.3f ms\n", t_bias_qkv);
   printf("[PROFILE] Split QKV: %.3f ms\n", t_split_qkv);
   printf("[PROFILE] RoPE: %.3f ms\n", t_rope);
   printf("[PROFILE] Attn scores: %.3f ms\n", t_attn_scores);
   printf("[PROFILE] Softmax attn: %.3f ms\n", t_softmax_attn);
   printf("[PROFILE] Attn weighted sum: %.3f ms\n", t_attn_weighted_sum);
   printf("[PROFILE] Gemm O: %.3f ms\n", t_gemm_o);
-  printf("[PROFILE] Bias O: %.3f ms\n", t_bias_o);
   printf("[PROFILE] AXPY TB2: %.3f ms\n", t_axpy_tb2);
   printf("[PROFILE] RMSNorm2: %.3f ms\n", t_rmsnorm_ffn);
   printf("[PROFILE] Gemm router: %.3f ms\n", t_gemm_router);
-  printf("[PROFILE] Bias router: %.3f ms\n", t_bias_router);
   printf("[PROFILE] TopK: %.3f ms\n", t_topk);
   printf("[PROFILE] Softmax MoE: %.3f ms\n", t_softmax_moe);
-  printf("[PROFILE] TopK cpy: %.3f ms\n", t_topk_cpy);
   printf("[PROFILE] Set vec: %.3f ms\n", t_set_vec);
   printf("[PROFILE] MoE Gemm MLP1: %.3f ms\n", t_moe_gemm_mlp1);
-  printf("[PROFILE] MoE Bias MLP1: %.3f ms\n", t_moe_bias_mlp1);
-  printf("[PROFILE] MoE Split gate up: %.3f ms\n", t_moe_split_gate_up);
   printf("[PROFILE] MoE SwiGLU: %.3f ms\n", t_moe_swiglu);
   printf("[PROFILE] MoE Gemm MLP2: %.3f ms\n", t_moe_gemm_mlp2);
-  printf("[PROFILE] MoE Bias MLP2: %.3f ms\n", t_moe_bias_mlp2);
-  printf("[PROFILE] MoE Wexps cpy: %.3f ms\n", t_wexps_cpy);
-  printf("[PROFILE] MoE AXPY: %.3f ms\n", t_moe_axpy);
   printf("[PROFILE] MoE Agg: %.3f ms\n", t_moe_axpy_agg);
   printf("[PROFILE] RMSNorm out: %.3f ms\n", t_rmsnorm_out);
   printf("[PROFILE] Gemm logits: %.3f ms\n", t_gemm_logits);

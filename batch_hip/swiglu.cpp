@@ -1,81 +1,49 @@
-// ==== Kernel batched: dữ liệu dạng [B, row_stride] ====
-// gate/up/out: [B, row_stride], liên tiếp theo chiều stride mỗi mẫu
-__global__ void k_swiglu_gate_up_batched(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    float* __restrict__ out,
-    int B, int row_stride, float alpha, float clampv)
+__global__ void k_swiglu_fused_gate_up_batched_bf16(
+    const float*      __restrict__ mlp1_out, // [B*I*2], xen kẽ: g,u,g,u,...
+    hip_bfloat16*     __restrict__ out,      // [B*I] (bf16)
+    int B, int I,                             // batch size, intermediate_dim per sample
+    float alpha, float clampv)
 {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x; // index trong 1 mẫu
-    const int b = blockIdx.y;                             // sample index
-    if (b >= B || i >= row_stride) return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x; // 0..I-1 (theo 1 mẫu)
+    const int b = blockIdx.y;                             // 0..B-1
+    if (b >= B || i >= I) return;
 
-    const size_t base = (size_t)b * (size_t)row_stride + (size_t)i;
+    // chỉ số phẳng cho phần tử (b,i)
+    const size_t f = (size_t)b * (size_t)I + (size_t)i;
 
-    float g = gate[base];
-    float u = up[base];
+    // đọc gate/up từ đầu vào xen kẽ (mỗi f tương ứng 2 phần tử liên tiếp)
+    float g = mlp1_out[2 * f + 0];
+    float u = mlp1_out[2 * f + 1];
 
-    // clamp (giữ nguyên đúng semantics bản đơn lẻ)
+    // clamp giống nguyên bản
     g = fminf(g, clampv);
     u = fminf(fmaxf(u, -clampv), clampv);
 
-    // SiLU(g) với hệ số alpha
-    g = g * (1.0f / (1.0f + expf(-alpha * g)));
+    // SiLU(g; alpha) = g * sigmoid(alpha*g)
+    // có thể thay expf bằng __expf nếu bạn build với fast-math
+    const float sig = 1.0f / (1.0f + expf(-alpha * g));
+    g = g * sig;
 
     // (u + 1) * SiLU(g)
     u = u + 1.0f;
-    out[base] = g * u;
+    out[f] = f32_to_bf16(g * u);
 }
 
-// ==== Wrapper: batched, stride = I (liền nhau theo mỗi mẫu) ====
-static inline void swiglu_gpu_batch(
-    float *gate, float *up, float *out,
-    int I, float alpha, float clampv, int B)
+static inline void swiglu_fused_gpu_batch_bf16(
+    const float*      mlp1_out,  // [B*I*2] xen kẽ g,u
+    hip_bfloat16*     out,       // [B*I] bf16
+    int I, int B,
+    float alpha, float clampv,
+    hipStream_t stream = 0)
 {
     const int BS = 256;
-    const int GX = (I + BS - 1) / BS;   // cột khối trong một mẫu
+    const int GX = (I + BS - 1) / BS;
     dim3 grid(GX, B);
     dim3 block(BS);
-    hipLaunchKernelGGL(k_swiglu_gate_up_batched, grid, block, 0, 0,
-                       gate, up, out, B, I, alpha, clampv);
-}
 
-__global__ void k_swiglu_gate_up_batched_bf16(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    hip_bfloat16* __restrict__ out,
-    int B, int row_stride, float alpha, float clampv)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x; // index trong 1 mẫu
-    const int b = blockIdx.y;                             // sample index
-    if (b >= B || i >= row_stride) return;
-
-    const size_t base = b * row_stride + i;
-
-    float g = gate[base];
-    float u = up[base];
-
-    // clamp (giữ nguyên đúng semantics bản đơn lẻ)
-    g = fminf(g, clampv);
-    u = fminf(fmaxf(u, -clampv), clampv);
-
-    // SiLU(g) với hệ số alpha
-    g = g * (1.0f / (1.0f + expf(-alpha * g)));
-
-    // (u + 1) * SiLU(g)
-    u = u + 1.0f;
-    out[base] = f32_to_bf16(g * u);
-}
-
-// ==== Wrapper: batched, stride = I (liền nhau theo mỗi mẫu) ====
-static inline void swiglu_gpu_batch_bf16(
-    float *gate, float *up, hip_bfloat16 *out,
-    int I, float alpha, float clampv, int B)
-{
-    const int BS = 256;
-    const int GX = (I + BS - 1) / BS;   // cột khối trong một mẫu
-    dim3 grid(GX, B);
-    dim3 block(BS);
-    hipLaunchKernelGGL(k_swiglu_gate_up_batched_bf16, grid, block, 0, 0,
-                       gate, up, out, B, I, alpha, clampv);
+    hipLaunchKernelGGL(
+        k_swiglu_fused_gate_up_batched_bf16,
+        grid, block, 0, stream,
+        mlp1_out, out, B, I, alpha, clampv
+    );
 }

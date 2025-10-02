@@ -56,6 +56,7 @@ typedef struct {
 
     float* h_p;
 
+    hip_bfloat16* d_w_token_embedding_table_bf16;
     hip_bfloat16* d_w_qkv_bf16;
     hip_bfloat16* d_w_o_bf16;
     hip_bfloat16* d_w_router_bf16;
@@ -78,14 +79,12 @@ typedef struct {
     float*  d_out;
     
     float* batch_mlp1_out;       // [max_batch_size, 2 * intermediate_dim]
-    float* batch_gate;           // [max_batch_size, intermediate_dim]
-    float* batch_up;             // [max_batch_size, intermediate_dim]
     hip_bfloat16* batch_gate_up;        // [max_batch_size, intermediate_dim]
 
 } BatchState;
 
 int NUM_GPUS = 2;
-const int MAX_BATCH_SIZE = 480;
+const int MAX_BATCH_SIZE = 880;
 BatchState* batch_states = NULL;
 TransformerWeights* transformer_weights = NULL;
 
@@ -149,11 +148,12 @@ static void convert_fp32_to_bf16_host_and_transpose(const float *src, hip_bfloat
   }
 }
 
-long long max4(long long a, long long b, long long c, long long d) {
+long long max5(long long a, long long b, long long c, long long d, long long e) {
   long long v = a;
   if (b > v) v = b;
   if (c > v) v = c;
   if (d > v) v = d;
+  if (e > v) v = e;
   return v;
 }
 
@@ -162,11 +162,12 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
   int n_layers = cfg->n_layers;
   int n_experts = cfg->n_experts;
 
-  long long size_tmp = max4(
+  long long size_tmp = max5(
     1ll * cfg->vocab_size * cfg->hidden_dim,
     1ll * n_layers * cfg->hidden_dim * (head_dim * (cfg->n_attn_heads + 2 * cfg->n_kv_heads)),
     1ll * n_layers * cfg->hidden_dim * n_experts,
-    1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim
+    1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim,
+    1ll * cfg->vocab_size * cfg->hidden_dim
   );
   hip_bfloat16 *tmp = (hip_bfloat16*)malloc(size_tmp * sizeof(hip_bfloat16));
   if (!tmp) {
@@ -174,7 +175,8 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
       exit(1);
   }
 
-  to_device(&w->token_embedding_table, ptr, 1ll*cfg->vocab_size*cfg->hidden_dim*sizeof(float));
+  convert_fp32_to_bf16_host(ptr, tmp, 1ll * cfg->vocab_size * cfg->hidden_dim);
+  to_device(&g_batch_state->d_w_token_embedding_table_bf16, tmp, 1ll * cfg->vocab_size * cfg->hidden_dim * sizeof(hip_bfloat16));
   ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
 
   convert_fp32_to_bf16_host_and_transpose(ptr, tmp, 1, cfg->vocab_size, cfg->hidden_dim);
@@ -256,7 +258,7 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
 }
 
 static void free_weights_gpu(TransformerWeights &w, BatchState *g_batch_state) {
-  free_device(w.token_embedding_table); 
+  free_device(g_batch_state->d_w_token_embedding_table_bf16); 
   
   free_device(w.rms_attn_w); 
   free_device(w.rms_ffn_w); 
@@ -319,7 +321,7 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
 
   // Attention caches: [n_layers, MAX_BATCH_SIZE, seq_len, kv_dim]
   {
-    const long long cache_elems = 1ll * c.n_layers * B * c.seq_len * kv_dim;
+    const long long cache_elems = 1ll * c.n_layers / 2 * B * (c.seq_len + c.sliding_window) * kv_dim;
     alloc_device(&bs.batch_k, cache_elems * sizeof(hip_bfloat16), hip_bfloat16(0.f), true);
     alloc_device(&bs.batch_v, cache_elems * sizeof(hip_bfloat16), hip_bfloat16(0.f), true);
   }
@@ -369,8 +371,6 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
   alloc_device(&bs.d_wexps, E * B * sizeof(float), 0.f, true);
   
   alloc_device(&bs.batch_mlp1_out, 1ll * B * (2 * I) * sizeof(float), 0.f, true);
-  alloc_device(&bs.batch_gate, 1ll * B * I * sizeof(float), 0.f, true);
-  alloc_device(&bs.batch_up, 1ll * B * I * sizeof(float), 0.f, true);
   alloc_device(&bs.batch_gate_up, 1ll * B * I * sizeof(hip_bfloat16), hip_bfloat16(0.f), true);
   alloc_device(&bs.d_out, 1ll * E * B * H * sizeof(float), 0.f, true);
 }
@@ -397,8 +397,6 @@ static void free_batchstate_on_device(BatchState &bs) {
   free_device(bs.d_wexps);
   free_device(bs.d_out);
   free_device(bs.batch_mlp1_out);
-  free_device(bs.batch_gate);
-  free_device(bs.batch_up);
   free_device(bs.batch_gate_up);
   free_device(bs.d_in_ptrs);
   free_host(bs.h_counts);
@@ -565,8 +563,10 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
         g_batch_state->current_tokens[i] = next_token;
 
-        if (next_token == 199999 || next_token == 200002 || pos >= max_steps) {
+        if (next_token == 199999 || next_token == 200002 || pos + 1 >= max_steps) {
           g_batch_state->finished[i] = true;
+          g_batch_state->positions[i] = 0;
+          g_batch_state->current_tokens[i] = g_batch_state->prompt_tokens[i][0];
           free(g_batch_state->prompt_tokens[i]);
           g_batch_state->prompt_tokens[i] = nullptr;
           active_count--;

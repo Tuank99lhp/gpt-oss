@@ -163,9 +163,10 @@
 
 template<int BM, int BN, int BK, int WAVES_M, int WAVES_N>
 __global__ void k_gemm_bf16core_yfp32_2x2waves_X2D(const hip_bfloat16* const* __restrict__ X,
-                                               const hip_bfloat16* __restrict__ W,
-                                               float*              __restrict__ Y,
-                                               int K, int M, int B)
+                                                   const hip_bfloat16*        __restrict__ W,
+                                                   float*                     __restrict__ Y,
+                                                   int K, int M, int B,
+                                                   const float*               __restrict__ bias)
 {
   const int tx = threadIdx.x;
   const int ty = threadIdx.y;
@@ -283,18 +284,19 @@ __global__ void k_gemm_bf16core_yfp32_2x2waves_X2D(const hip_bfloat16* const* __
     for (int j = 0; j < SUB_TILES_N; ++j) {
       const int mcol = out_m0 + j * 16 + tx;
       if (mcol < M) {
-        Y[brow * M + mcol] = acc[j][i];
+        Y[brow * M + mcol] = acc[j][i] + (bias ? bias[mcol] : 0.f);
       }
     }
   }
 }
 
 template<int BM, int BN, int BK, int WAVES_M, int WAVES_N>
-static inline void gemm_gpu_batch_bf16core_yfp32_X2D(float*              __restrict__ Y,
-                                                 const hip_bfloat16* const* __restrict__ X,
-                                                 const hip_bfloat16* __restrict__ W,
-                                                 int K, int M, int B,
-                                                 hipStream_t stream = 0)
+static inline void gemm_gpu_batch_bf16core_yfp32_X2D(float*                     __restrict__ Y,
+                                                     const hip_bfloat16* const* __restrict__ X,
+                                                     const hip_bfloat16*        __restrict__ W,
+                                                     int K, int M, int B,
+                                                     const float*               __restrict__ bias = nullptr,
+                                                     hipStream_t stream = 0)
 {
   if (K <= 0 || M <= 0 || B <= 0) return;
 
@@ -311,6 +313,6 @@ static inline void gemm_gpu_batch_bf16core_yfp32_X2D(float*              __restr
   hipLaunchKernelGGL(
     HIP_KERNEL_NAME((k_gemm_bf16core_yfp32_2x2waves_X2D<BM, BN, BK, WAVES_M, WAVES_N>)),
     grid, block, 0, stream,
-    X, W, Y, K, M, B
+    X, W, Y, K, M, B, bias
   );
 }
