@@ -18,7 +18,6 @@ typedef struct {
     int* req_ids;
 
     // Logits
-    float** logits_batch;        // [batch_size]  (tùy chọn) mảng con trỏ tới logits device per-seq
     float*  batch_logits;        // [batch_size, vocab_size] logits trên device (contiguous)
 
     // ==== Pre-allocated buffers for batched operations (device) ====
@@ -54,7 +53,11 @@ typedef struct {
     float* cosB;
     float* sinB;
 
-    float* h_p;
+    int* next_tokens;
+    int* d_next_tokens;
+
+    float* coins;
+    float* d_coins;
 
     hip_bfloat16* d_w_token_embedding_table_bf16;
     hip_bfloat16* d_w_qkv_bf16;
@@ -84,7 +87,7 @@ typedef struct {
 } BatchState;
 
 int NUM_GPUS = 2;
-const int MAX_BATCH_SIZE = 880;
+const int MAX_BATCH_SIZE = 890;
 BatchState* batch_states = NULL;
 TransformerWeights* transformer_weights = NULL;
 
@@ -148,12 +151,10 @@ static void convert_fp32_to_bf16_host_and_transpose(const float *src, hip_bfloat
   }
 }
 
-long long max5(long long a, long long b, long long c, long long d, long long e) {
+long long max3(long long a, long long b, long long c) {
   long long v = a;
   if (b > v) v = b;
   if (c > v) v = c;
-  if (d > v) v = d;
-  if (e > v) v = e;
   return v;
 }
 
@@ -162,12 +163,10 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr, Batc
   int n_layers = cfg->n_layers;
   int n_experts = cfg->n_experts;
 
-  long long size_tmp = max5(
+  long long size_tmp = max3(
     1ll * cfg->vocab_size * cfg->hidden_dim,
     1ll * n_layers * cfg->hidden_dim * (head_dim * (cfg->n_attn_heads + 2 * cfg->n_kv_heads)),
-    1ll * n_layers * cfg->hidden_dim * n_experts,
-    1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim,
-    1ll * cfg->vocab_size * cfg->hidden_dim
+    1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim
   );
   hip_bfloat16 *tmp = (hip_bfloat16*)malloc(size_tmp * sizeof(hip_bfloat16));
   if (!tmp) {
@@ -299,9 +298,6 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
   bs.finished          = (bool *)calloc(MAX_BATCH_SIZE, sizeof(bool));
   bs.req_ids           = (int  *)calloc(MAX_BATCH_SIZE, sizeof(int));
 
-  // logits: host mảng con trỏ & device buffer chứa logits liên tiếp
-  bs.logits_batch = (float**)malloc(MAX_BATCH_SIZE * sizeof(float*));
-
   // ====== Device-side batched buffers ======
   const int H   = c.hidden_dim;
   const int D   = c.head_dim;
@@ -339,9 +335,6 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
   
   // Logits buffer (device) + map host con trỏ
   alloc_device(&bs.batch_logits, 1ll * B * c.vocab_size * sizeof(float), 0.f, true);
-  for (int i = 0; i < MAX_BATCH_SIZE; ++i) {
-    bs.logits_batch[i] = bs.batch_logits + 1ll * i * c.vocab_size;
-  }
 
   if (c.sliding_window > 0) {
     // host-init mask once then copy
@@ -414,7 +407,6 @@ static void free_batchstate_on_device(BatchState &bs) {
   free_host(bs.num_prompt_tokens);
   free_host(bs.current_tokens);
   free_host(bs.finished);
-  free_host(bs.logits_batch);
   free_host(bs.req_ids);
 
 }
@@ -451,8 +443,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     alloc_device(&g_batch_state->cosB, MAX_BATCH_SIZE * half * sizeof(float), 0.f, true);
     alloc_device(&g_batch_state->sinB, MAX_BATCH_SIZE * half * sizeof(float), 0.f, true);
 
-    g_batch_state->h_p = (float*)malloc(c.vocab_size * sizeof(float));
-      
+    g_batch_state->next_tokens = (int*)malloc(MAX_BATCH_SIZE * sizeof(int));
+    alloc_device(&g_batch_state->d_next_tokens, MAX_BATCH_SIZE * sizeof(int), 0, true);
+
+    g_batch_state->coins = (float*)malloc(MAX_BATCH_SIZE * sizeof(float));
+    alloc_device(&g_batch_state->d_coins, MAX_BATCH_SIZE * sizeof(float), 0.f, true);
+
     alloc_device(&g_batch_state->g_inv_freq_dev, half * sizeof(float), 0.f, true);
     alloc_device(&g_batch_state->d_conc, sizeof(float), 0.f, true);
   }
@@ -479,7 +475,11 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     free_device(g_batch_state->cosB);
     free_device(g_batch_state->sinB);
 
-    free_host(g_batch_state->h_p);
+    free_host(g_batch_state->next_tokens);
+    free_device(g_batch_state->d_next_tokens);
+
+    free_host(g_batch_state->coins);
+    free_device(g_batch_state->d_coins);
 
     free_device(g_batch_state->g_inv_freq_dev);
     free_device(g_batch_state->d_conc);
@@ -537,6 +537,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
     while (active_count) {
       forward_batch(transformer, batch_size);
 
+      bool called_sample = false;
       for (int i = 0; i < batch_size; ++i) {
         if (g_batch_state->finished[i]) {
           continue;
@@ -549,8 +550,18 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
         if (pos < g_batch_state->num_prompt_tokens[i]) {
           next_token = g_batch_state->prompt_tokens[i][pos];
         } else {
+          if (!called_sample) {
+            sample_gpu_batch(
+              sampler, g_batch_state->batch_logits, batch_size,       
+              g_batch_state->d_next_tokens, 
+              g_batch_state->coins, g_batch_state->d_coins    
+            );
+            hipMemcpy(g_batch_state->next_tokens, g_batch_state->d_next_tokens,
+                      batch_size * sizeof(int), hipMemcpyDeviceToHost);
 
-          next_token = sample_gpu(sampler, g_batch_state->logits_batch[i]);
+            called_sample = true;
+          }
+          next_token = g_batch_state->next_tokens[i];
 
           int *output_tokens = get_tok_gen_ptr(requests, req_idx);
           int out_pos = pos - g_batch_state->num_prompt_tokens[i];
