@@ -233,8 +233,6 @@ __global__ void k_gemm_bf16core_yfp32_2x2waves_X2D(const hip_bfloat16* const* __
       load_B_tile(nxt, k0 + BK);
     }
 
-    __syncthreads();
-
     #pragma unroll
     for (int t = 0; t < (BK / 16); ++t) {
       const int base_rel = t * 16 + ty * 4;
