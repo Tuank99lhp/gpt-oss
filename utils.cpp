@@ -112,3 +112,22 @@ __device__ __forceinline__ Float4 gld_f32x4(const float* p) {
   }
   return v;
 }
+
+// ---------------- Warp helpers ----------------
+__device__ __forceinline__ float shfl_down_f(float v, int off) {
+  return __shfl_down(v, off, WARP_SIZE);
+}
+__device__ __forceinline__ int shfl_down_i(int v, int off) {
+  return __shfl_down(v, off, WARP_SIZE);
+}
+
+// Reduce (max,value) kèm index với tie-break: nếu bằng nhau -> chọn index nhỏ hơn
+__device__ __forceinline__ void warp_argmax_reduce(float &val, int &idx) {
+  for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
+    float v2 = shfl_down_f(val, off);
+    int   i2 = shfl_down_i(idx, off);
+    if (v2 > val || (v2 == val && i2 < idx)) {
+      val = v2; idx = i2;
+    }
+  }
+}

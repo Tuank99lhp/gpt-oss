@@ -77,7 +77,6 @@ typedef struct {
     int*    h_counts;
     int*    d_counts;
     int*    d_idx_in_batch;
-    float*  d_wexps;
     hip_bfloat16** d_in_ptrs;
     float*  d_out;
     
@@ -360,8 +359,6 @@ static void alloc_batchstate_on_device(BatchState &bs, const Config &c) {
   
   HIP_CHECK(hipMalloc((void**)&bs.d_in_ptrs, E * B * sizeof(hip_bfloat16*)));
   HIP_CHECK(hipMemset(bs.d_in_ptrs, 0, E * B * sizeof(hip_bfloat16*)));
-
-  alloc_device(&bs.d_wexps, E * B * sizeof(float), 0.f, true);
   
   alloc_device(&bs.batch_mlp1_out, 1ll * B * (2 * I) * sizeof(float), 0.f, true);
   alloc_device(&bs.batch_gate_up, 1ll * B * I * sizeof(hip_bfloat16), hip_bfloat16(0.f), true);
@@ -387,7 +384,6 @@ static void free_batchstate_on_device(BatchState &bs) {
   
   free_device(bs.d_counts);
   free_device(bs.d_idx_in_batch);
-  free_device(bs.d_wexps);
   free_device(bs.d_out);
   free_device(bs.batch_mlp1_out);
   free_device(bs.batch_gate_up);

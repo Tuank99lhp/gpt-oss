@@ -115,8 +115,7 @@ __global__ void k_moe_assign_from_topk_bf16(const int*   __restrict__ topk_idx, 
                                        int H, int B, int K, int E,
                                        int*        __restrict__ counts,        // [E]
                                        int*        __restrict__ idx_in_batch,  // [E*B]
-                                       hip_bfloat16**     __restrict__ in_ptrs,       // [E*B] (mảng con trỏ)
-                                       float*      __restrict__ wexps)         // [E*B]
+                                       hip_bfloat16**     __restrict__ in_ptrs)       // [E*B] (mảng con trỏ)
 {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int NK  = B * K;
@@ -137,7 +136,6 @@ __global__ void k_moe_assign_from_topk_bf16(const int*   __restrict__ topk_idx, 
     // trỏ tới dòng b trong batch_t
     // LƯU Ý: đây là con trỏ device -> device; HIP hỗ trợ viết pointer vào memory device.
     in_ptrs[e * B + pos] = const_cast<hip_bfloat16*>(batch_t + b * H);
-    wexps  [e * B + pos] = w;
   }
 }
 
@@ -149,7 +147,6 @@ void moe_assign_from_topk_bf16(
     int*        __restrict__ counts,        // [E]
     int*        __restrict__ idx_in_batch,  // [E*B]
     hip_bfloat16**     __restrict__ in_ptrs,       // [E*B] (mảng con trỏ)
-    float*      __restrict__ wexps,         // [E*B]
     hipStream_t stream = 0)
 {
   if (H <= 0 || B <= 0 || K <= 0 || E <= 0) return;
@@ -164,5 +161,5 @@ void moe_assign_from_topk_bf16(
       /*sharedMemBytes=*/0, stream,
       topk_idx, topk_val, batch_t,
       H, B, K, E,
-      counts, idx_in_batch, in_ptrs, wexps);
+      counts, idx_in_batch, in_ptrs);
 }

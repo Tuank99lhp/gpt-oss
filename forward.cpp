@@ -353,8 +353,7 @@ TIME_BLOCK({
       H, batch_size, K, E,
       g_batch_state->d_counts,
       g_batch_state->d_idx_in_batch,
-      g_batch_state->d_in_ptrs,
-      g_batch_state->d_wexps
+      g_batch_state->d_in_ptrs
     );
 
     

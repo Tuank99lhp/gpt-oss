@@ -1,22 +1,3 @@
-// ---------------- Warp helpers ----------------
-__device__ __forceinline__ float shfl_down_f(float v, int off) {
-  return __shfl_down(v, off, WARP_SIZE);
-}
-__device__ __forceinline__ int shfl_down_i(int v, int off) {
-  return __shfl_down(v, off, WARP_SIZE);
-}
-
-// Reduce (max,value) kèm index với tie-break: nếu bằng nhau -> chọn index nhỏ hơn
-__device__ __forceinline__ void warp_argmax_reduce(float &val, int &idx) {
-  for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
-    float v2 = shfl_down_f(val, off);
-    int   i2 = shfl_down_i(idx, off);
-    if (v2 > val || (v2 == val && i2 < idx)) {
-      val = v2; idx = i2;
-    }
-  }
-}
-
 __global__ void k_argmax_rows_opt(const float* __restrict__ logits,
                                   int V, int B, int use_vec4,
                                   int* __restrict__ out_idx) {
