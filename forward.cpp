@@ -68,19 +68,6 @@ void forward_batch(Transformer *transformer, int batch_size) {
   float t_rmsnorm_out = 0, t_gemm_logits = 0;
 
   hipEvent_t ev_start, ev_stop;
-  #define TIME_BLOCK(fn_call, t_accum) { \
-    if (first_print) { \
-      hipEventCreate(&ev_start); hipEventCreate(&ev_stop); \
-      hipEventRecord(ev_start, 0); \
-    } \
-      fn_call; \
-    if (first_print) { \
-      hipEventRecord(ev_stop, 0); hipEventSynchronize(ev_stop); \
-      float ms; hipEventElapsedTime(&ms, ev_start, ev_stop); \
-      t_accum += ms; \
-      hipEventDestroy(ev_start); hipEventDestroy(ev_stop); \
-    } \
-  }
 
   int device_id = 0;
   HIP_CHECK(hipGetDevice(&device_id));
@@ -364,7 +351,7 @@ TIME_BLOCK({
     const long long mlp1_per = 2ll * I * H;
     const long long mlp2_per = 1ll * H * I;
 
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (int e = 0; e < E; e++) {
       int B = g_batch_state->h_counts[e];
       if (B > 0) {

@@ -7,6 +7,20 @@
   } \
 } while(0)
 
+#define TIME_BLOCK(fn_call, t_accum) { \
+  if (first_print) { \
+    hipEventCreate(&ev_start); hipEventCreate(&ev_stop); \
+    hipEventRecord(ev_start, 0); \
+  } \
+    fn_call; \
+  if (first_print) { \
+    hipEventRecord(ev_stop, 0); hipEventSynchronize(ev_stop); \
+    float ms; hipEventElapsedTime(&ms, ev_start, ev_stop); \
+    t_accum += ms; \
+    hipEventDestroy(ev_start); hipEventDestroy(ev_stop); \
+  } \
+}
+
 // ===== Helpers =====
 #ifndef WARP_SIZE
 #define WARP_SIZE warpSize        // 64 on AMD, 32 on NVIDIA
